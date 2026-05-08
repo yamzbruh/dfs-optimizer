@@ -1,0 +1,66 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Data files (too large for git)
+data/cache/
+data/parquet/
+data/uploads/
+*.parquet
+*.csv
+!tests/fixtures/*.csv
+
+# Logs
+*.log
+logs/
+
+# ML artifacts
+mlruns/
+*.pkl
+*.joblib
+*.h5
+*.model
+
+# Frontend
+node_modules/
+.next/
+out/
+build/
+
+# OS
+Thumbs.db
