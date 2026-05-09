@@ -100,27 +100,33 @@ class PointsModel:
     def train(
         self,
         years: list[int] | None = None,
-        test_year: int = 2026,
+        holdout_year: int = 2025,
+        holdout_month: int = 5,
         force_rebuild_features: bool = False,
     ) -> dict:
         """Train q15 / q50 / q85 quantile regressors.
 
         Args:
-            years: Training seasons.  Defaults to ``[2023, 2024, 2025]``.
-            test_year: Hold-out season for evaluation.
+            years: All seasons to include in the feature matrix.
+                Defaults to ``[2023, 2024, 2025, 2026]``.
+            holdout_year: Year component of the holdout window.
+            holdout_month: Month component of the holdout window.
+                Training uses every row *outside* this year+month;
+                evaluation uses every row *inside* it.
+                Default: May 2025 — recent enough to be representative,
+                old enough that 2026 data is untouched.
             force_rebuild_features: When ``True``, ignore the cached
                 feature matrix and rebuild from Statcast Parquet files.
 
         Returns:
             Metrics dict with RMSE, MAE, coverage, and interval width.
         """
-        _years = years if years is not None else [2023, 2024, 2025]
+        _years = years if years is not None else [2023, 2024, 2025, 2026]
         t_total = time.time()
 
         # -- a. Load or build feature matrix ---------------------------------
         df = self._load_feature_matrix(
             train_years=_years,
-            test_year=test_year,
             force_rebuild=force_rebuild_features,
         )
         if df is None or df.empty:
@@ -130,26 +136,38 @@ class PointsModel:
                 "or pass force_rebuild_features=True."
             )
 
-        # -- b. Train / test split by season year ----------------------------
+        # -- b. Train / test split by year+month holdout ---------------------
         if "game_date" not in df.columns:
             raise RuntimeError("Feature matrix missing 'game_date' column.")
 
         df["game_date"] = pd.to_datetime(df["game_date"])
-        train_mask = df["game_date"].dt.year.isin(_years)
-        test_mask = df["game_date"].dt.year == test_year
+        test_mask = (
+            (df["game_date"].dt.year == holdout_year)
+            & (df["game_date"].dt.month == holdout_month)
+        )
+        train_mask = ~test_mask
 
         train_df = df.loc[train_mask].copy()
         test_df = df.loc[test_mask].copy()
 
+        import calendar
+        month_name = calendar.month_name[holdout_month]
         logger.info(
-            f"Train set: {len(train_df):,} rows ({_years})  |  "
-            f"Test set:  {len(test_df):,} rows ({test_year})"
+            f"Train: {len(train_df):,} rows "
+            f"(all data except {month_name} {holdout_year})"
+        )
+        logger.info(
+            f"Test holdout: {len(test_df):,} rows "
+            f"({month_name} {holdout_year})"
         )
 
         if train_df.empty:
-            raise RuntimeError(f"No training data found for years {_years}.")
+            raise RuntimeError("No training data found for the given years.")
         if test_df.empty:
-            logger.warning(f"No test data found for year {test_year}; skipping evaluation.")
+            logger.warning(
+                f"No holdout data found for {month_name} {holdout_year}; "
+                "evaluation metrics will be skipped."
+            )
 
         # -- c. Resolve feature columns --------------------------------------
         all_features = FeatureEngineer().get_feature_columns()
@@ -268,7 +286,8 @@ class PointsModel:
             "test_rows": len(test_df),
             "feature_count": len(present),
             "train_years": _years,
-            "test_year": test_year,
+            "holdout_year": holdout_year,
+            "holdout_month": holdout_month,
         }
         return metrics
 
@@ -490,7 +509,6 @@ class PointsModel:
     def _load_feature_matrix(
         self,
         train_years: list[int],
-        test_year: int,
         force_rebuild: bool,
     ) -> pd.DataFrame | None:
         """Load the cached feature matrix or rebuild it if needed."""
@@ -503,6 +521,6 @@ class PointsModel:
                 return df
 
         logger.info("Building feature matrix from Statcast Parquet files…")
-        all_years = sorted(set(train_years) | {test_year})
+        all_years = sorted(set(train_years))
         df = FeatureEngineer().build_full_batter_feature_matrix(years=all_years)
         return df if (df is not None and not df.empty) else None
