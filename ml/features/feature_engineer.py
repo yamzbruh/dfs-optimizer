@@ -175,6 +175,34 @@ class FeatureEngineer:
         if "game_date" in result.columns:
             result["game_date"] = pd.to_datetime(result["game_date"])
 
+        # Normalise barrel to a clean 0/1 float before rolling.
+        # pybaseball's statcast() does not always return a 'barrel' column.
+        # When absent, derive it from 'launch_speed_angle': Statcast codes
+        # 6 = Barrel in its launch-speed/angle categorical classification.
+        # When 'barrel' IS present it may be 1.0/NaN (not 0/1), so coerce
+        # and fill regardless of source.
+        if "barrel" not in result.columns:
+            if "launch_speed_angle" in result.columns:
+                result["barrel"] = (
+                    pd.to_numeric(result["launch_speed_angle"], errors="coerce") == 6
+                ).astype(float)
+                logger.debug(
+                    "build_rolling_batter_features: derived 'barrel' from "
+                    "'launch_speed_angle == 6'"
+                )
+            else:
+                logger.warning(
+                    "build_rolling_batter_features: neither 'barrel' nor "
+                    "'launch_speed_angle' found; barrel_rate columns will be skipped"
+                )
+
+        if "barrel" in result.columns:
+            result["barrel"] = (
+                pd.to_numeric(result["barrel"], errors="coerce")
+                .fillna(0)
+                .clip(0, 1)
+            )
+
         # Pre-build the hard-hit binary before grouping.
         if "launch_speed" in result.columns:
             result["_hard_hit"] = (result["launch_speed"] >= 95).astype(float)
@@ -452,6 +480,7 @@ class FeatureEngineer:
 
         df = self.build_rolling_batter_features(df)
         df = self.build_platoon_features(df)
+        df = self.build_batting_order_features(df)
         df = self.build_game_context_features(df)
         df = self.build_dk_points_labels(df)
 
