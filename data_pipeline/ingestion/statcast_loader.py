@@ -254,10 +254,10 @@ class StatcastLoader:
             resp.raise_for_status()
             data = resp.json()
 
-            splits = (
-                data.get("stats", [{}])[0]
-                .get("splits", [])
-            )
+            stats_list = data.get("stats", [])
+            if not stats_list:
+                return pd.DataFrame()
+            splits = stats_list[0].get("splits", [])
             if not splits:
                 return pd.DataFrame()
 
@@ -334,10 +334,10 @@ class StatcastLoader:
             resp.raise_for_status()
             data = resp.json()
 
-            splits = (
-                data.get("stats", [{}])[0]
-                .get("splits", [])
-            )
+            stats_list = data.get("stats", [])
+            if not stats_list:
+                return pd.DataFrame()
+            splits = stats_list[0].get("splits", [])
             if not splits:
                 return pd.DataFrame()
 

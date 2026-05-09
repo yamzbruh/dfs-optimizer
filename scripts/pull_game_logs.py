@@ -36,16 +36,49 @@ SEASONS = [2023, 2024, 2025, 2026]
 
 
 def get_unique_batter_ids(cache: ParquetCache, season: int) -> list[int]:
-    """Get unique MLBAM batter IDs from cached Statcast data."""
-    df = cache.load(f"statcast/batters_{season}")
-    if df is None or df.empty:
+    """Get MLBAM batter IDs for hitting game logs: 50+ PAs, not in pitcher pool.
+
+    Cross-references batter Statcast with pitcher Statcast and requires at
+    least 50 plate appearances in the season cache (filters call-ups and
+    fringe players).
+    """
+    batter_df = cache.load(f"statcast/batters_{season}")
+    if batter_df is None or batter_df.empty:
         return []
-    if "batter" not in df.columns:
+
+    pitcher_df = cache.load(f"statcast/pitchers_{season}")
+    pitcher_ids: set[int] = set()
+    if pitcher_df is not None and not pitcher_df.empty:
+        if "pitcher" in pitcher_df.columns:
+            p = pd.to_numeric(pitcher_df["pitcher"], errors="coerce").dropna()
+            pitcher_ids = set(p.astype(int).unique().tolist())
+
+    if "batter" not in batter_df.columns:
         return []
-    s = pd.to_numeric(df["batter"], errors="coerce").dropna().astype(int)
-    ids = sorted(s.unique().tolist())
-    logger.info(f"Found {len(ids)} unique batters for {season}")
-    return ids
+
+    b = pd.to_numeric(batter_df["batter"], errors="coerce").dropna()
+    batter_ids = set(b.astype(int).unique().tolist())
+
+    pa_counts = (
+        batter_df["batter"]
+        .dropna()
+        .apply(lambda x: pd.to_numeric(x, errors="coerce"))
+        .dropna()
+        .astype(int)
+        .value_counts()
+    )
+    qualified_ids = set(
+        pa_counts[pa_counts >= 50].index.astype(int)
+    )
+
+    hitter_ids = qualified_ids - pitcher_ids
+    logger.info(
+        f"Season {season}: {len(batter_ids)} total batters, "
+        f"{len(pitcher_ids)} pitchers excluded, "
+        f"{len(qualified_ids)} with 50+ PAs, "
+        f"{len(hitter_ids)} qualifying hitters"
+    )
+    return sorted(hitter_ids)
 
 
 def get_unique_pitcher_ids(cache: ParquetCache, season: int) -> list[int]:
