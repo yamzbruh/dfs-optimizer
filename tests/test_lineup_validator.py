@@ -82,7 +82,8 @@ def make_valid_lineup() -> list[tuple[DKPlayer, str]]:
     Salary ladder is tuned so the total sits exactly at the cap
     ($50,000) and well above the floor ($47,000):
 
-        P    9500
+        P    9500  (pitcher 1)
+        P    4000  (pitcher 2)
         C    4500
         1B   5000
         2B   4500
@@ -91,12 +92,17 @@ def make_valid_lineup() -> list[tuple[DKPlayer, str]]:
         OF   4500
         OF   4500
         OF   4000
-        UTIL 4000
         ----------
              50000
+
+    Index map (used by several tests):
+        0=P1  1=P2  2=C  3=1B  4=2B  5=3B  6=SS  7=OF1  8=OF2  9=OF3
     """
-    pitcher = make_player(
+    pitcher1 = make_player(
         "Pitcher One", "p1", 9500, ["P"], "LAD", "ATL", "LAD"
+    )
+    pitcher2 = make_player(
+        "Pitcher Two", "p2", 4000, ["P"], "ATL", "ATL", "LAD"
     )
     catcher = make_player(
         "Catcher One", "c1", 4500, ["C"], "ATL", "ATL", "LAD"
@@ -122,21 +128,18 @@ def make_valid_lineup() -> list[tuple[DKPlayer, str]]:
     outfield_3 = make_player(
         "OF Three", "of3", 4000, ["OF"], "LAD", "ATL", "LAD"
     )
-    utility = make_player(
-        "Util One", "util1", 4000, ["1B", "OF"], "ARI", "NYM", "ARI"
-    )
 
     return [
-        (pitcher, RosterSlot.P.value),
-        (catcher, RosterSlot.C.value),
-        (first_base, RosterSlot.FIRST_BASE.value),
-        (second_base, RosterSlot.SECOND_BASE.value),
-        (third_base, RosterSlot.THIRD_BASE.value),
-        (shortstop, RosterSlot.SS.value),
-        (outfield_1, RosterSlot.OF.value),
-        (outfield_2, RosterSlot.OF.value),
-        (outfield_3, RosterSlot.OF.value),
-        (utility, RosterSlot.UTIL.value),
+        (pitcher1,    RosterSlot.P.value),           # index 0
+        (pitcher2,    RosterSlot.P.value),           # index 1
+        (catcher,     RosterSlot.C.value),           # index 2
+        (first_base,  RosterSlot.FIRST_BASE.value),  # index 3
+        (second_base, RosterSlot.SECOND_BASE.value), # index 4
+        (third_base,  RosterSlot.THIRD_BASE.value),  # index 5
+        (shortstop,   RosterSlot.SS.value),          # index 6
+        (outfield_1,  RosterSlot.OF.value),          # index 7
+        (outfield_2,  RosterSlot.OF.value),          # index 8
+        (outfield_3,  RosterSlot.OF.value),          # index 9
     ]
 
 
@@ -207,9 +210,9 @@ def test_eleven_players_fails_player_count() -> None:
 
 def test_duplicate_player_fails() -> None:
     lineup = make_valid_lineup()
-    # Replace the UTIL slot with the same dk_id as one of the OFs.
-    of_player = lineup[6][0]
-    lineup[-1] = (of_player, RosterSlot.UTIL.value)
+    # Replace the last OF with the same player as the first OF.
+    of_player = lineup[7][0]  # OF One (index 7)
+    lineup[-1] = (of_player, RosterSlot.OF.value)
     result = LineupValidator().validate(lineup)
     assert result.is_valid is False
     assert _has_rule(result.errors, "no_duplicates")
@@ -235,7 +238,8 @@ def test_salary_cap_exceeded_fails() -> None:
 
 def test_salary_below_floor_fails() -> None:
     lineup = make_valid_lineup()
-    # Replace several players with cheap ones to drop below 47k.
+    # Replace pitcher1 (9500→4000) and OF One (4500→2500) to drop below 47k.
+    # Total drops from 50000 to 42500 (< 47000 floor).
     cheap_pitcher = make_player(
         "Cheap Pitcher", "p_cheap", 4000, ["P"], "LAD", "ATL", "LAD"
     )
@@ -243,26 +247,15 @@ def test_salary_below_floor_fails() -> None:
         "Cheap OF", "of_cheap", 2500, ["OF"], "NYM", "NYM", "ARI"
     )
     lineup[0] = (cheap_pitcher, RosterSlot.P.value)
-    lineup[6] = (cheap_of, RosterSlot.OF.value)
+    lineup[7] = (cheap_of, RosterSlot.OF.value)  # index 7 = OF One
     result = LineupValidator().validate(lineup)
     assert result.is_valid is False
     assert _has_rule(result.errors, "salary_floor")
 
 
 # ----------------------------------------------------------------------
-# Position slots / eligibility / UTIL pitcher rule
+# Position slots / eligibility
 # ----------------------------------------------------------------------
-
-
-def test_pitcher_in_util_slot_fails() -> None:
-    lineup = make_valid_lineup()
-    pitcher_in_util = make_player(
-        "Pitcher Util", "p_util", 4000, ["P"], "LAD", "ATL", "LAD"
-    )
-    lineup[-1] = (pitcher_in_util, RosterSlot.UTIL.value)
-    result = LineupValidator().validate(lineup)
-    assert result.is_valid is False
-    assert _has_rule(result.errors, "util_not_pitcher")
 
 
 def test_wrong_position_in_slot_fails() -> None:
@@ -278,40 +271,35 @@ def test_wrong_position_in_slot_fails() -> None:
 
 
 def test_dual_eligible_player_fills_either_slot() -> None:
-    """A 1B/OF player should be valid in both 1B and OF assignments."""
+    """A 1B/OF player should be valid in both 1B and OF slot assignments."""
     base = make_valid_lineup()
-    dual = make_player(
-        "Ohtani-like", "dual1", 6500, ["1B", "OF"], "LAD", "ATL", "LAD"
-    )
 
-    # Variant A: dual fills the 1B slot.
-    variant_a = list(base)
-    # Replace 1B and rebalance: drop 1B (5000) → swap in dual (6500) costs +1500.
-    # Drop UTIL (4000) → swap in cheap UTIL (2500) saves 1500. Net 0.
-    cheap_util = make_player(
-        "Cheap Util", "util_cheap", 2500, ["1B", "OF"], "ARI", "NYM", "ARI"
+    # Variant A: dual (1B/OF, same salary as original 1B) fills the 1B slot.
+    # Swapping a 5000 1B for a 5000 dual — salary unchanged → total stays 50000.
+    dual_a = make_player(
+        "Ohtani-like", "dual1", 5000, ["1B", "OF"], "LAD", "ATL", "LAD"
     )
-    variant_a[2] = (dual, RosterSlot.FIRST_BASE.value)
-    variant_a[-1] = (cheap_util, RosterSlot.UTIL.value)
+    variant_a = list(base)
+    variant_a[3] = (dual_a, RosterSlot.FIRST_BASE.value)  # index 3 = 1B
     result_a = LineupValidator().validate(variant_a)
     assert result_a.is_valid is True, result_a.errors
 
-    # Variant B: dual fills an OF slot instead.
-    variant_b = list(base)
-    variant_b[6] = (dual, RosterSlot.OF.value)
-    # Replacing a 4500 OF with a 6500 dual costs +2000; lower UTIL by 2000.
-    cheap_util_b = make_player(
-        "Cheap Util B", "util_cheap_b", 2000, ["1B", "OF"], "ARI", "NYM", "ARI"
+    # Variant B: dual (1B/OF, same salary as original OF1) fills an OF slot.
+    # Swapping a 4500 OF for a 4500 dual — salary unchanged → total stays 50000.
+    dual_b = make_player(
+        "Ohtani-like B", "dual1b", 4500, ["1B", "OF"], "LAD", "ATL", "LAD"
     )
-    variant_b[-1] = (cheap_util_b, RosterSlot.UTIL.value)
+    variant_b = list(base)
+    variant_b[7] = (dual_b, RosterSlot.OF.value)  # index 7 = OF One
     result_b = LineupValidator().validate(variant_b)
     assert result_b.is_valid is True, result_b.errors
 
 
 def test_missing_required_slot_fails() -> None:
-    """Two OFs and no SS should trip both position_slots and eligibility."""
+    """Replacing 3B with an extra OF should fire a position_slots error."""
     lineup = make_valid_lineup()
-    # Replace shortstop with another OF, ineligible for SS.
+    # Replace 3B (index 5) with an OF-only player at the OF slot.
+    # This leaves the 3B slot unfilled and adds a 4th OF, both wrong.
     extra_of = make_player(
         "Extra OF", "of_extra", 5000, ["OF"], "ATL", "ATL", "LAD"
     )
@@ -329,23 +317,23 @@ def test_missing_required_slot_fails() -> None:
 def test_all_players_same_game_fails() -> None:
     """Stack all 10 players in the ATL@LAD game → min_games error."""
     players_one_game = [
-        make_player("P1",  "p1",  9500, ["P"],  "LAD", "ATL", "LAD"),
-        make_player("C1",  "c1",  4500, ["C"],  "ATL", "ATL", "LAD"),
-        make_player("F1",  "1b1", 5000, ["1B"], "LAD", "ATL", "LAD"),
-        make_player("Sec1","2b1", 4500, ["2B"], "ATL", "ATL", "LAD"),
-        make_player("T1",  "3b1", 4500, ["3B"], "LAD", "ATL", "LAD"),
-        make_player("S1",  "ss1", 5000, ["SS"], "ATL", "ATL", "LAD"),
-        make_player("O1",  "of1", 4500, ["OF"], "LAD", "ATL", "LAD"),
-        make_player("O2",  "of2", 4500, ["OF"], "ATL", "ATL", "LAD"),
-        make_player("O3",  "of3", 4000, ["OF"], "LAD", "ATL", "LAD"),
-        make_player("U1",  "u1",  4000, ["1B", "OF"], "ATL", "ATL", "LAD"),
+        make_player("P1",   "p1",  9500, ["P"],  "LAD", "ATL", "LAD"),
+        make_player("P2",   "p2",  4000, ["P"],  "ATL", "ATL", "LAD"),
+        make_player("C1",   "c1",  4500, ["C"],  "ATL", "ATL", "LAD"),
+        make_player("F1",   "1b1", 5000, ["1B"], "LAD", "ATL", "LAD"),
+        make_player("Sec1", "2b1", 4500, ["2B"], "ATL", "ATL", "LAD"),
+        make_player("T1",   "3b1", 4500, ["3B"], "LAD", "ATL", "LAD"),
+        make_player("S1",   "ss1", 5000, ["SS"], "ATL", "ATL", "LAD"),
+        make_player("O1",   "of1", 4500, ["OF"], "LAD", "ATL", "LAD"),
+        make_player("O2",   "of2", 4500, ["OF"], "ATL", "ATL", "LAD"),
+        make_player("O3",   "of3", 4000, ["OF"], "LAD", "ATL", "LAD"),
     ]
     slots = [
-        RosterSlot.P.value, RosterSlot.C.value,
+        RosterSlot.P.value, RosterSlot.P.value,
+        RosterSlot.C.value,
         RosterSlot.FIRST_BASE.value, RosterSlot.SECOND_BASE.value,
         RosterSlot.THIRD_BASE.value, RosterSlot.SS.value,
         RosterSlot.OF.value, RosterSlot.OF.value, RosterSlot.OF.value,
-        RosterSlot.UTIL.value,
     ]
     lineup = list(zip(players_one_game, slots))
     result = LineupValidator().validate(lineup)
@@ -364,7 +352,7 @@ def test_scratched_player_fails() -> None:
         "Scratched OF", "of_scratch", 4500, ["OF"], "NYM",
         "NYM", "ARI", lineup_status="scratched",
     )
-    lineup[6] = (scratched_of, RosterSlot.OF.value)
+    lineup[7] = (scratched_of, RosterSlot.OF.value)
     result = LineupValidator().validate(lineup)
     assert result.is_valid is False
     assert _has_rule(result.errors, "no_scratched")
@@ -376,7 +364,7 @@ def test_unknown_status_emits_warning_not_error() -> None:
         "Unknown Player", "of_unknown", 4500, ["OF"], "NYM",
         "NYM", "ARI", lineup_status="unknown",
     )
-    lineup[6] = (unknown, RosterSlot.OF.value)
+    lineup[7] = (unknown, RosterSlot.OF.value)
     result = LineupValidator().validate(lineup)
     assert result.is_valid is True
     assert any(
@@ -390,7 +378,7 @@ def test_projected_starting_emits_warning() -> None:
         "Projected Player", "of_projected", 4500, ["OF"], "NYM",
         "NYM", "ARI", lineup_status="projected_starting",
     )
-    lineup[6] = (projected, RosterSlot.OF.value)
+    lineup[7] = (projected, RosterSlot.OF.value)
     result = LineupValidator().validate(lineup)
     assert result.is_valid is True
     assert any(
@@ -514,7 +502,7 @@ def test_bankroll_blocks_with_scratched_player() -> None:
                 f"Scratched OF {i}", f"scratched_{i}", 4500, ["OF"],
                 "NYM", "NYM", "ARI", lineup_status="scratched",
             )
-            lineup[6] = (scratched, RosterSlot.OF.value)
+            lineup[7] = (scratched, RosterSlot.OF.value)
         lineups.append(lineup)
 
     validated = _validated(*lineups)
@@ -533,7 +521,7 @@ def test_bankroll_warns_on_projected_starting_player() -> None:
                 f"Projected OF {i}", f"proj_{i}", 4500, ["OF"],
                 "NYM", "NYM", "ARI", lineup_status="projected_starting",
             )
-            lineup[6] = (projected, RosterSlot.OF.value)
+            lineup[7] = (projected, RosterSlot.OF.value)
         lineups.append(lineup)
 
     validated = _validated(*lineups)
@@ -552,7 +540,7 @@ def test_bankroll_blocks_unknown_player_within_30min_of_lock() -> None:
                 f"Unknown OF {i}", f"unk_{i}", 4500, ["OF"],
                 "NYM", "NYM", "ARI", lineup_status="unknown",
             )
-            lineup[6] = (unknown, RosterSlot.OF.value)
+            lineup[7] = (unknown, RosterSlot.OF.value)
         lineups.append(lineup)
 
     validated = _validated(*lineups)
@@ -573,7 +561,7 @@ def test_bankroll_does_not_block_unknown_when_lock_is_far_away() -> None:
                 f"Unknown OF {i}", f"unk_{i}", 4500, ["OF"],
                 "NYM", "NYM", "ARI", lineup_status="unknown",
             )
-            lineup[6] = (unknown, RosterSlot.OF.value)
+            lineup[7] = (unknown, RosterSlot.OF.value)
         lineups.append(lineup)
 
     validated = _validated(*lineups)
@@ -594,7 +582,7 @@ def test_bankroll_resolves_minutes_from_lock_time() -> None:
                 f"Unknown OF {i}", f"unk_{i}", 4500, ["OF"],
                 "NYM", "NYM", "ARI", lineup_status="unknown",
             )
-            lineup[6] = (unknown, RosterSlot.OF.value)
+            lineup[7] = (unknown, RosterSlot.OF.value)
         lineups.append(lineup)
 
     validated = _validated(*lineups)

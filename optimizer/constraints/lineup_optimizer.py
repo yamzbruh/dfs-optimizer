@@ -45,20 +45,16 @@ from optimizer.constraints.lineup_validator import (  # noqa: E402
 # Constants
 # ---------------------------------------------------------------------------
 
-# DK MLB classic required slot counts.
+# DK MLB classic required slot counts (2 P, no UTIL).
 _REQUIRED_SLOTS: dict[str, int] = {
-    "P":    1,
-    "C":    1,
-    "1B":   1,
-    "2B":   1,
-    "3B":   1,
-    "SS":   1,
-    "OF":   3,
-    "UTIL": 1,
+    "P":  2,
+    "C":  1,
+    "1B": 1,
+    "2B": 1,
+    "3B": 1,
+    "SS": 1,
+    "OF": 3,
 }
-
-# Positions eligible for the UTIL slot (all non-pitchers).
-_UTIL_ELIGIBLE: frozenset[str] = frozenset({"C", "1B", "2B", "3B", "SS", "OF"})
 
 
 # ---------------------------------------------------------------------------
@@ -178,69 +174,94 @@ class LineupOptimizer:
         _prev = previous_lineups or []
 
         n = len(projections)
+
+        # Slot sequence — duplicate names appear for repeated positions.
+        SLOT_NAMES = ["P", "P", "C", "1B", "2B", "3B", "SS", "OF", "OF", "OF"]
+        n_slots = len(SLOT_NAMES)  # 10
+
         prob = pulp.LpProblem("dk_lineup", pulp.LpMaximize)
 
-        # -- Decision variables ----------------------------------------------
-        # x[i] = 1 if player i is selected in this lineup.
+        # -- Selection variables ---------------------------------------------
+        # x[i] = 1 if player i is selected in the lineup.
         x = [pulp.LpVariable(f"x_{i}", cat="Binary") for i in range(n)]
 
-        # y[game_key] = 1 if at least one player from that game is selected.
+        # -- Slot-assignment variables ---------------------------------------
+        # z[i][j] = 1 when player i fills slot j; None when ineligible.
+        # Using explicit slot-assignment prevents dual-eligible players from
+        # simultaneously satisfying two slot constraints (the root cause of
+        # infeasible post-solve assignments in a selection-only ILP).
+        z: list[list] = [[None] * n_slots for _ in range(n)]
+        for i, proj in enumerate(projections):
+            elig = proj.player.position_eligibility
+            for j, slot_name in enumerate(SLOT_NAMES):
+                if slot_name in elig:
+                    z[i][j] = pulp.LpVariable(f"z_{i}_{j}", cat="Binary")
+
+        # -- Game indicator variables ----------------------------------------
         games = list({_game_key(p.player) for p in projections})
-        y = {g: pulp.LpVariable(f"y_{gi}", cat="Binary") for gi, g in enumerate(games)}
+        y = {
+            g: pulp.LpVariable(f"y_{gi}", cat="Binary")
+            for gi, g in enumerate(games)
+        }
 
         # -- Objective: maximise median projected points ---------------------
         prob += pulp.lpSum(projections[i].pts_q50 * x[i] for i in range(n))
 
-        # -- Hard constraints ------------------------------------------------
+        # -- Link x[i] to slot assignments: x[i] = Σ_j z[i][j] -------------
+        for i in range(n):
+            slot_vars = [z[i][j] for j in range(n_slots) if z[i][j] is not None]
+            if slot_vars:
+                prob += (
+                    x[i] == pulp.lpSum(slot_vars),
+                    f"x_link_{i}",
+                )
+            else:
+                # No eligible slot for this player — exclude them.
+                prob += x[i] == 0, f"x_ineligible_{i}"
 
-        # a. Salary cap.
+        # -- Each player fills at most one slot ------------------------------
+        for i in range(n):
+            slot_vars = [z[i][j] for j in range(n_slots) if z[i][j] is not None]
+            if len(slot_vars) > 1:
+                prob += (
+                    pulp.lpSum(slot_vars) <= 1,
+                    f"player_once_{i}",
+                )
+
+        # -- Each slot filled by exactly one eligible player -----------------
+        for j in range(n_slots):
+            eligible_vars = [
+                z[i][j] for i in range(n) if z[i][j] is not None
+            ]
+            if eligible_vars:
+                prob += (
+                    pulp.lpSum(eligible_vars) == 1,
+                    f"slot_{j}",
+                )
+            else:
+                logger.warning(
+                    f"optimize_single: no eligible players for slot "
+                    f"{j} ({SLOT_NAMES[j]}); problem is infeasible"
+                )
+
+        # -- Salary cap ------------------------------------------------------
         prob += (
             pulp.lpSum(projections[i].player.salary * x[i] for i in range(n))
             <= SALARY_CAP,
             "salary_cap",
         )
 
-        # Salary floor — soft in the validator but enforce here to avoid
-        # trivially cheap lineups that the validator would reject anyway.
+        # -- Salary floor (enforced to avoid lineups the validator rejects) --
         prob += (
             pulp.lpSum(projections[i].player.salary * x[i] for i in range(n))
             >= SALARY_FLOOR,
             "salary_floor",
         )
 
-        # b. Exactly 10 players.
+        # -- Exactly 10 players (redundant but aids branch-and-bound) --------
         prob += pulp.lpSum(x) == 10, "ten_players"
 
-        # c. Position eligibility sets.
-        eligible = self._build_eligibility(projections)
-
-        # Non-UTIL slot counts: exactly the required number, with the
-        # exception of OF which is exactly 3.
-        # We use >= for regular slots and keep total == 10 to implicitly
-        # fill the UTIL slot with whatever's left.
-        prob += (
-            pulp.lpSum(x[i] for i in eligible["P"]) == 1,
-            "slot_P",
-        )
-        for pos in ("C", "1B", "2B", "3B", "SS"):
-            prob += (
-                pulp.lpSum(x[i] for i in eligible[pos]) >= 1,
-                f"slot_{pos}",
-            )
-        prob += (
-            pulp.lpSum(x[i] for i in eligible["OF"]) >= 3,
-            "slot_OF",
-        )
-        # UTIL must be fillable by a non-pitcher — guaranteed by the
-        # eligibility matrix (pitchers are excluded from UTIL).
-        prob += (
-            pulp.lpSum(x[i] for i in eligible["UTIL"]) >= 1,
-            "slot_UTIL",
-        )
-
-        # d. Minimum 2 games represented.
-        #    y[g] >= x[i] for every player i in game g  →  y[g]=1 when selected.
-        #    y[g] <= sum(x[i] for i in game g)           →  y[g]=0 when none selected.
+        # -- Minimum 2 games represented -------------------------------------
         for g in games:
             game_indices = [
                 i for i in range(n) if _game_key(projections[i].player) == g
@@ -255,17 +276,17 @@ class LineupOptimizer:
             )
         prob += pulp.lpSum(y.values()) >= 2, "min_games"
 
-        # e. Locked players.
+        # -- Locked players --------------------------------------------------
         for i, proj in enumerate(projections):
             if proj.player.dk_id in _locked or proj.is_locked:
                 prob += x[i] == 1, f"locked_{proj.player.dk_id}"
 
-        # f. Banned players.
+        # -- Banned players --------------------------------------------------
         for i, proj in enumerate(projections):
             if proj.player.dk_id in _banned or proj.is_banned:
                 prob += x[i] == 0, f"banned_{proj.player.dk_id}"
 
-        # g. Diversity: overlap with each previous lineup <= min_overlap_penalty.
+        # -- Diversity: overlap with prior lineups ≤ min_overlap_penalty ----
         for li, prev in enumerate(_prev):
             prev_ids = prev.player_dk_ids
             overlap_vars = [
@@ -283,47 +304,74 @@ class LineupOptimizer:
 
         status = pulp.LpStatus[prob.status]
         if status != "Optimal":
-            logger.warning(f"optimize_single: solver status={status!r}; returning None")
+            logger.warning(
+                f"optimize_single: solver status={status!r}; returning None"
+            )
             return None
 
-        # -- Extract solution ------------------------------------------------
+        # -- Extract slot assignments from z variables -----------------------
+        # z[i][j] == 1 tells us exactly which slot player i occupies.
+        assigned_triples: list[tuple[DKPlayer, str, int]] = []
+        for i in range(n):
+            for j in range(n_slots):
+                if (
+                    z[i][j] is not None
+                    and pulp.value(z[i][j]) is not None
+                    and pulp.value(z[i][j]) > 0.5
+                ):
+                    assigned_triples.append(
+                        (projections[i].player, SLOT_NAMES[j], j)
+                    )
+                    break  # Each player is in at most one slot.
+
+        if len(assigned_triples) != 10:
+            logger.warning(
+                f"optimize_single: extracted {len(assigned_triples)} slot "
+                f"assignments (expected 10); returning None"
+            )
+            return None
+
+        # Sort into canonical DK order: P, P, C, 1B, 2B, 3B, SS, OF, OF, OF.
+        assigned_triples.sort(key=lambda t: t[2])
+        assigned_pairs = [(p, s) for p, s, _ in assigned_triples]
+
         selected = [
             projections[i] for i in range(n)
             if pulp.value(x[i]) is not None and pulp.value(x[i]) > 0.5
         ]
-
-        if len(selected) != 10:
-            logger.warning(
-                f"optimize_single: solver selected {len(selected)} players "
-                f"(expected 10); returning None"
-            )
-            return None
-
-        assigned = self.assign_positions(selected)
-        total_salary = sum(p.salary for p, _ in assigned)
+        total_salary = sum(p.salary for p, _ in assigned_pairs)
         projected_pts = sum(proj.pts_q50 for proj in selected)
         lev = float(np.mean([proj.leverage_score for proj in selected]))
 
-        result = LineupResult(
-            players=assigned,
+        return LineupResult(
+            players=assigned_pairs,
             total_salary=total_salary,
             projected_pts=projected_pts,
             leverage_score=lev,
-            portfolio_score=0.0,   # Filled by generate_lineups after all lineups are known.
+            portfolio_score=0.0,  # Filled by generate_lineups after all are built.
             is_valid=False,
         )
-        return result
 
     def assign_positions(
         self, selected: list[PlayerProjection]
     ) -> list[tuple[DKPlayer, str]]:
-        """Greedily assign DK roster slots to the selected 10 players.
+        """Assign DK roster slots to the selected 10 players via backtracking.
 
-        Assignment order mirrors DK's slot priority:
-        1. P  — must be P-only eligible (pitcher)
-        2. C, 1B, 2B, 3B, SS  — first eligible unassigned player each
-        3. OF  × 3             — next OF-eligible unassigned players
-        4. UTIL                — the remaining player (must be non-pitcher)
+        A pure greedy pass fails for dual-eligible players: assigning
+        Ohtani (1B/OF) to 1B may later leave the OF slots with too few
+        eligible players.  This method solves that by:
+
+        1. Sorting players so the *least flexible* are tried first
+           (pitchers always first, then ascending eligibility count).
+           Flexible players act as gap-fillers rather than slot-takers.
+        2. Recursively trying every valid assignment for each slot in the
+           fixed order ``P, C, 1B, 2B, 3B, SS, OF, OF, OF, UTIL``.
+        3. Backtracking immediately when a slot cannot be filled, trying
+           the next candidate for the previous slot.
+
+        Falls back to the original greedy method (with a warning) only
+        if backtracking exhausts all possibilities — which should never
+        happen on a legally-constructed ILP solution.
 
         Args:
             selected: Exactly 10 ``PlayerProjection`` objects chosen
@@ -331,41 +379,89 @@ class LineupOptimizer:
 
         Returns:
             List of ``(DKPlayer, roster_slot)`` tuples in the order the
-            slots are assigned.
+            slots are assigned (P first, UTIL last).
         """
-        assigned: dict[str, str] = {}   # dk_id → slot
+        # Slot sequence for DK MLB classic (2 P, no UTIL).
+        slots = ["P", "P", "C", "1B", "2B", "3B", "SS", "OF", "OF", "OF"]
+
+        # Sort: pitchers first, then by ascending flexibility (fewest
+        # eligible positions first so dual-eligibles remain available
+        # for slots that need them).
+        def _sort_key(proj: PlayerProjection) -> tuple:
+            elig = proj.player.position_eligibility
+            is_pitcher = int("P" not in elig)   # 0 = pitcher (sort first)
+            return (is_pitcher, len(elig))
+
+        pool = sorted(selected, key=_sort_key)
+
+        # --- Backtracking solver -------------------------------------------
+
+        def _eligible_for(proj: PlayerProjection, slot: str) -> bool:
+            return slot in proj.player.position_eligibility
+
+        def _backtrack(
+            slot_idx: int,
+            assignment: dict[str, str],   # dk_id → slot
+        ) -> bool:
+            """Return True and populate ``assignment`` when all slots filled."""
+            if slot_idx == len(slots):
+                return True
+
+            slot = slots[slot_idx]
+            for proj in pool:
+                dk_id = proj.player.dk_id
+                if dk_id in assignment:
+                    continue
+                if not _eligible_for(proj, slot):
+                    continue
+                assignment[dk_id] = slot
+                if _backtrack(slot_idx + 1, assignment):
+                    return True
+                del assignment[dk_id]   # backtrack
+
+            return False   # no candidate filled this slot
+
+        assignment: dict[str, str] = {}
+        success = _backtrack(0, assignment)
+
+        if not success:
+            logger.warning(
+                "assign_positions: backtracking failed — falling back to greedy. "
+                "This may indicate an infeasible position combination from the ILP."
+            )
+            return self._greedy_assign(selected)
+
+        # Reconstruct in DK slot order for clean output.
+        slot_order = {s: i for i, s in enumerate(slots)}
+        result = sorted(
+            [(proj.player, assignment[proj.player.dk_id]) for proj in selected],
+            key=lambda t: (slot_order.get(t[1], 99), t[0].name),
+        )
+        return result
+
+    def _greedy_assign(
+        self, selected: list[PlayerProjection]
+    ) -> list[tuple[DKPlayer, str]]:
+        """Original greedy fallback; used only when backtracking fails."""
+        assigned: dict[str, str] = {}
         remaining = list(selected)
 
-        def _assign_slot(slot: str, eligibility_check) -> bool:
-            """Pop the first eligible unassigned player into ``slot``."""
+        def _take(slot: str, check) -> None:
             for proj in remaining:
-                if eligibility_check(proj) and proj.player.dk_id not in assigned:
+                if check(proj) and proj.player.dk_id not in assigned:
                     assigned[proj.player.dk_id] = slot
                     remaining.remove(proj)
-                    return True
-            return False
+                    return
 
-        # 1. Pitcher.
-        _assign_slot("P", lambda p: "P" in p.player.position_eligibility)
-
-        # 2. Infield / Catcher.
+        for _ in range(2):
+            _take("P", lambda p: "P" in p.player.position_eligibility)
         for pos in ("C", "1B", "2B", "3B", "SS"):
-            _assign_slot(pos, lambda p, s=pos: s in p.player.position_eligibility)
-
-        # 3. Three outfielders.
+            _take(pos, lambda p, s=pos: s in p.player.position_eligibility)
         for _ in range(3):
-            _assign_slot("OF", lambda p: "OF" in p.player.position_eligibility)
+            _take("OF", lambda p: "OF" in p.player.position_eligibility)
 
-        # 4. UTIL — whoever is left.
-        for proj in list(remaining):
-            if proj.player.dk_id not in assigned:
-                assigned[proj.player.dk_id] = "UTIL"
-                remaining.remove(proj)
-                break
-
-        # Reconstruct in input order for consistent output.
         return [
-            (proj.player, assigned.get(proj.player.dk_id, "UTIL"))
+            (proj.player, assigned.get(proj.player.dk_id, "P"))
             for proj in selected
         ]
 
@@ -485,21 +581,13 @@ class LineupOptimizer:
     def _build_eligibility(
         self, projections: list[PlayerProjection]
     ) -> dict[str, list[int]]:
-        """Build slot → [player index] eligibility map.
-
-        UTIL is open to all non-pitchers (any player whose eligibility
-        includes at least one non-P position).
-        """
+        """Build slot → [player index] eligibility map for the classic (2 P) format."""
         eligible: dict[str, list[int]] = {slot: [] for slot in _REQUIRED_SLOTS}
 
         for i, proj in enumerate(projections):
-            elig = proj.player.position_eligibility
-            for pos in elig:
+            for pos in proj.player.position_eligibility:
                 if pos in eligible:
                     eligible[pos].append(i)
-            # UTIL: eligible if any non-P position exists.
-            if any(p in _UTIL_ELIGIBLE for p in elig):
-                eligible["UTIL"].append(i)
 
         return eligible
 

@@ -12,9 +12,8 @@ classic contest rules:
 * exactly 10 players
 * salary cap $50,000 (hard error if exceeded)
 * salary floor $47,000 (hard error; manual override exists upstream)
-* one each of P / C / 1B / 2B / 3B / SS / UTIL, three OF
-* a slot must be in the player's ``position_eligibility`` (UTIL is
-  open to any non-pitcher)
+* two P, one each of C / 1B / 2B / 3B / SS, three OF
+* a slot must be in the player's ``position_eligibility``
 * players must come from at least two different games
 * no duplicate players
 * no scratched players, banned players, or missing locks
@@ -37,16 +36,15 @@ LINEUP_SIZE: int = 10
 SALARY_CAP: int = 50_000
 SALARY_FLOOR: int = 47_000
 
-# Required slot counts in a complete classic lineup.
+# Required slot counts in a complete classic lineup (2 P, no UTIL).
 SLOT_REQUIREMENTS: dict[str, int] = {
-    "P": 1,
+    "P": 2,
     "C": 1,
     "1B": 1,
     "2B": 1,
     "3B": 1,
     "SS": 1,
     "OF": 3,
-    "UTIL": 1,
 }
 
 # DK's lineup_status values. Any value outside this set is treated as
@@ -63,7 +61,7 @@ VALID_LINEUP_STATUSES: frozenset[str] = frozenset(
 
 
 class RosterSlot(str, Enum):
-    """The eight DK MLB classic roster slots, as displayed in the upload CSV."""
+    """The seven DK MLB classic roster slots, as displayed in the upload CSV."""
 
     P = "P"
     C = "C"
@@ -72,7 +70,6 @@ class RosterSlot(str, Enum):
     THIRD_BASE = "3B"
     SS = "SS"
     OF = "OF"
-    UTIL = "UTIL"
 
 
 # Set of valid slot strings, for quick membership checks.
@@ -164,7 +161,6 @@ class LineupValidator:
             self._check_salary_floor(total_salary),
             self._check_position_slots(slots),
             self._check_position_eligibility(lineup),
-            self._check_util_not_pitcher(lineup),
             self._check_min_games(players),
             self._check_no_scratched(players),
             self._check_lineup_status_warning(players),
@@ -313,16 +309,9 @@ class LineupValidator:
     def _check_position_eligibility(
         self, lineup: LineupAssignment
     ) -> list[ValidationError]:
-        """A player's assigned slot must match their eligibility.
-
-        UTIL is open to any non-pitcher; everything else requires the
-        slot to be present in ``position_eligibility``.
-        """
+        """Each player's assigned slot must be in their ``position_eligibility``."""
         errors: list[ValidationError] = []
         for player, slot in lineup:
-            if slot == RosterSlot.UTIL.value:
-                # UTIL eligibility is checked separately (no pitchers).
-                continue
             if slot not in player.position_eligibility:
                 errors.append(
                     ValidationError(
@@ -341,28 +330,8 @@ class LineupValidator:
     def _check_util_not_pitcher(
         self, lineup: LineupAssignment
     ) -> list[ValidationError]:
-        """The UTIL slot must not be filled by a pitcher."""
-        errors: list[ValidationError] = []
-        for player, slot in lineup:
-            if slot != RosterSlot.UTIL.value:
-                continue
-            # A pitcher is anyone whose only eligibility is "P", or
-            # whose is_pitcher flag is set. In practice DK only allows
-            # P-only players to be pitchers, but we check both for safety.
-            is_p_only = player.position_eligibility == ["P"]
-            if is_p_only or getattr(player, "is_pitcher", False):
-                errors.append(
-                    ValidationError(
-                        rule="util_not_pitcher",
-                        message=(
-                            f"{player.name} is a pitcher and cannot fill "
-                            "the UTIL slot"
-                        ),
-                        severity="error",
-                        player_name=player.name,
-                    )
-                )
-        return errors
+        """No-op: DK MLB classic has no UTIL slot (2 P slots instead)."""
+        return []
 
     def _check_min_games(
         self, players: list[DKPlayer]
