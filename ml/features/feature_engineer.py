@@ -1,18 +1,23 @@
 """Statcast → ML feature engineering for the XGBoost points projection model.
 
 Transforms raw pitch-by-pitch Statcast data (stored in Parquet) into a
-feature matrix suitable for training and inference.  Every public method
-returns a *new* DataFrame — input DataFrames are never modified in place.
+game-level feature matrix suitable for training and inference.  Every public
+method returns a *new* DataFrame — input DataFrames are never modified in place.
 
 Pipeline order for the full batter feature matrix::
 
-    load_statcast_years
+    load_statcast_years            (PA-level, ~651k rows)
         → build_rolling_batter_features
         → build_platoon_features
+        → build_batting_order_features
         → build_game_context_features
-        → build_dk_points_labels
-        → (drop null dk_points)
-        → save to cache
+        → join_game_log_features   (adds R / RBI / SB from MLB Stats API)
+        → build_dk_points_labels   (PA-level DK points + R/RBI/SB scoring)
+        → aggregate_to_game_level  (collapse to ~120k player-game rows)
+        → (drop null dk_points_game)
+        → save to "features/batter_feature_matrix_game_level"
+
+Target variable: ``dk_points_game`` — total DK points a player scored in a game.
 """
 
 from __future__ import annotations
@@ -72,7 +77,7 @@ class FeatureEngineer:
         fe = FeatureEngineer()
         matrix = fe.build_full_batter_feature_matrix([2023, 2024, 2025])
         X = matrix[fe.get_feature_columns()]
-        y = matrix["dk_points"]
+        y = matrix["dk_points_game"]
     """
 
     def __init__(self, cache_dir: str = "data/parquet") -> None:
@@ -367,10 +372,13 @@ class FeatureEngineer:
 
         result["dk_points"] = result["events"].map(_DK_EVENT_POINTS).fillna(0.0)
 
-        # Add box-score components when available.
-        if "runs_scored" in result.columns:
+        # Add game-log components when available (from join_game_log_features).
+        # "runs" is the column name from MLB Stats API game logs.
+        # "runs_scored" is a legacy alias — check both, prefer "runs".
+        runs_col = "runs" if "runs" in result.columns else "runs_scored"
+        if runs_col in result.columns:
             result["dk_points"] += pd.to_numeric(
-                result["runs_scored"], errors="coerce"
+                result[runs_col], errors="coerce"
             ).fillna(0) * 2.0
         if "rbi" in result.columns:
             result["dk_points"] += pd.to_numeric(
@@ -445,6 +453,171 @@ class FeatureEngineer:
         return result
 
     # ------------------------------------------------------------------
+    # Game-log join and game-level aggregation
+    # ------------------------------------------------------------------
+
+    def join_game_log_features(
+        self,
+        df: pd.DataFrame,
+        years: list[int],
+    ) -> pd.DataFrame:
+        """Join per-game R, RBI, SB from MLB Stats API game logs to PA data.
+
+        Loads cached ``gamelogs/hitting_{year}`` Parquets written by
+        ``StatcastLoader.get_season_game_logs_hitting``.  Those logs use
+        MLBAM batter IDs directly, so no crosswalk is required.  A
+        left-merge on ``(batter, game_date)`` attaches the game totals to
+        every plate-appearance row for that player-game.
+
+        If no game logs are cached the columns are filled with 0 and a
+        warning is logged — the pipeline never crashes.
+
+        Columns added: ``runs``, ``rbi``, ``stolen_bases``
+
+        Args:
+            df: PA-level Statcast DataFrame with ``batter`` and
+                ``game_date`` columns.
+            years: Season years whose ``gamelogs/hitting_{year}`` Parquets
+                to load.
+
+        Returns:
+            New DataFrame with ``runs``, ``rbi``, ``stolen_bases`` columns
+            appended (0 where the join finds no match).
+        """
+        if df is None or df.empty:
+            logger.warning("join_game_log_features: empty input")
+            return df if df is not None else pd.DataFrame()
+
+        result = df.copy()
+
+        frames: list[pd.DataFrame] = []
+        for year in years:
+            key = f"gamelogs/hitting_{year}"
+            gl = self.cache.load(key)
+            if gl is not None and not gl.empty:
+                frames.append(gl)
+                logger.debug(f"Loaded game logs: {key} ({len(gl):,} rows)")
+
+        if not frames:
+            logger.warning(
+                "join_game_log_features: no game logs cached. "
+                "Run scripts/pull_game_logs.py --all first. "
+                "R/RBI/SB will be 0."
+            )
+            result["runs"] = 0
+            result["rbi"] = 0
+            result["stolen_bases"] = 0
+            return result
+
+        game_logs = pd.concat(frames, ignore_index=True)
+        game_logs["game_date"] = pd.to_datetime(game_logs["game_date"])
+        game_logs["batter"] = pd.to_numeric(
+            game_logs["batter"], errors="coerce"
+        ).astype("Int64")
+
+        keep_cols = [c for c in ["batter", "game_date", "runs", "rbi", "stolen_bases"]
+                     if c in game_logs.columns]
+        game_logs = game_logs[keep_cols]
+
+        result["game_date"] = pd.to_datetime(result["game_date"])
+        result["batter"] = pd.to_numeric(
+            result["batter"], errors="coerce"
+        ).astype("Int64")
+
+        result = result.merge(game_logs, on=["batter", "game_date"], how="left")
+
+        for col in ("runs", "rbi", "stolen_bases"):
+            if col not in result.columns:
+                result[col] = 0
+            else:
+                result[col] = result[col].fillna(0)
+
+        joined = result[["runs", "rbi", "stolen_bases"]].gt(0).any(axis=1).sum()
+        logger.info(
+            f"join_game_log_features: R/RBI/SB joined for "
+            f"{joined:,} of {len(result):,} PA rows"
+        )
+        return result
+
+    def aggregate_to_game_level(
+        self,
+        df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Aggregate PA-level Statcast data to one row per player per game.
+
+        This collapses the ~651k PA-row training set to ~120k player-game
+        rows so XGBoost learns to predict *total game DK points* rather
+        than single plate-appearance outcomes.
+
+        Aggregation rules per ``(batter, game_date)`` group:
+
+        * **SUM**: ``dk_points`` (renamed to ``dk_points_game``), ``runs``,
+          ``rbi``, ``stolen_bases``, ``_pa`` (renamed to ``pa_count``).
+        * **LAST**: all rolling ``*_{7,14,30}d`` columns, ``platoon_advantage``,
+          ``same_hand``, ``batting_order_multiplier``, ``is_close_game``,
+          ``is_high_leverage``, ``run_diff``, ``p_throws``, ``stand``.
+        * **FIRST**: ``home_team``, ``away_team``, ``game_pk``.
+
+        Args:
+            df: PA-level DataFrame that has already passed through the full
+                feature-builder chain including ``build_dk_points_labels``.
+
+        Returns:
+            New DataFrame with one row per ``(batter, game_date)`` and a
+            ``dk_points_game`` target column.
+        """
+        if df is None or df.empty:
+            logger.warning("aggregate_to_game_level: empty input")
+            return df if df is not None else pd.DataFrame()
+
+        logger.info(f"Aggregating {len(df):,} PA rows to game level…")
+
+        result = df.copy()
+        result["_pa"] = 1
+
+        sum_cols = [c for c in ("dk_points", "runs", "rbi", "stolen_bases", "_pa")
+                    if c in result.columns]
+
+        rolling_cols = [c for c in result.columns
+                        if any(c.endswith(f"_{w}d") for w in ("7", "14", "30"))]
+
+        last_cols = [c for c in (
+            "platoon_advantage", "same_hand", "batting_order_multiplier",
+            "is_close_game", "is_high_leverage", "run_diff",
+            "p_throws", "stand",
+        ) if c in result.columns]
+
+        first_cols = [c for c in ("home_team", "away_team", "game_pk")
+                      if c in result.columns]
+
+        agg_dict: dict[str, str] = {}
+        for col in sum_cols:
+            agg_dict[col] = "sum"
+        for col in rolling_cols:
+            agg_dict[col] = "last"
+        for col in last_cols:
+            agg_dict[col] = "last"
+        for col in first_cols:
+            agg_dict[col] = "first"
+
+        grouped = (
+            result.groupby(["batter", "game_date"], sort=True)
+            .agg(agg_dict)
+            .reset_index()          # batter and game_date become columns
+        )
+
+        grouped = grouped.rename(columns={
+            "dk_points": "dk_points_game",
+            "_pa": "pa_count",
+        })
+
+        logger.info(
+            f"aggregate_to_game_level: {len(df):,} PA rows → "
+            f"{len(grouped):,} player-game rows"
+        )
+        return grouped
+
+    # ------------------------------------------------------------------
     # Full pipeline
     # ------------------------------------------------------------------
 
@@ -456,22 +629,24 @@ class FeatureEngineer:
 
         Pipeline order:
 
-        1. ``load_statcast_years``
-        2. ``build_rolling_batter_features``
-        3. ``build_platoon_features``
-        4. ``build_batting_order_features``
-        5. ``build_game_context_features``
-        6. ``build_dk_points_labels``
-        7. Drop rows where ``dk_points`` is null.
-        8. Save to ``features/batter_feature_matrix``.
+        1. ``load_statcast_years``             — PA-level Statcast events
+        2. ``build_rolling_batter_features``   — rolling xwOBA / EV / barrel / HH
+        3. ``build_platoon_features``          — platoon advantage / same-hand
+        4. ``build_batting_order_features``    — order-slot multiplier
+        5. ``build_game_context_features``     — run-diff / leverage flags
+        6. ``join_game_log_features``          — R / RBI / SB from MLB Stats API
+        7. ``build_dk_points_labels``          — PA-level DK pts incl. R/RBI/SB
+        8. ``aggregate_to_game_level``         — collapse to player-game rows
+        9. Drop rows where ``dk_points_game`` is null.
+        10. Save to ``features/batter_feature_matrix_game_level``.
 
         Args:
             years: Season years to include.  Defaults to
                 ``[2023, 2024, 2025, 2026]``.
 
         Returns:
-            Final feature matrix, or an empty DataFrame if no source
-            data was available.
+            Game-level feature matrix with target ``dk_points_game``, or an
+            empty DataFrame if no source data was available.
         """
         _years = years if years is not None else [2023, 2024, 2025, 2026]
 
@@ -487,13 +662,15 @@ class FeatureEngineer:
         df = self.build_platoon_features(df)
         df = self.build_batting_order_features(df)
         df = self.build_game_context_features(df)
+        df = self.join_game_log_features(df, _years)
         df = self.build_dk_points_labels(df)
+        df = self.aggregate_to_game_level(df)
 
         before = len(df)
-        df = df[df["dk_points"].notna()].copy()
+        df = df[df["dk_points_game"].notna()].copy()
         dropped = before - len(df)
         if dropped:
-            logger.debug(f"Dropped {dropped:,} rows with null dk_points")
+            logger.debug(f"Dropped {dropped:,} rows with null dk_points_game")
 
         logger.info(
             f"build_full_batter_feature_matrix: final shape={df.shape}  "
@@ -503,11 +680,12 @@ class FeatureEngineer:
         if not df.empty:
             self.cache.save(
                 df,
-                "features/batter_feature_matrix",
+                "features/batter_feature_matrix_game_level",
                 metadata={
                     "years": _years,
                     "rows": len(df),
                     "feature_cols": self.get_feature_columns(),
+                    "target": "dk_points_game",
                 },
             )
 
@@ -516,9 +694,13 @@ class FeatureEngineer:
     def get_feature_columns(self) -> list[str]:
         """Return the canonical list of training feature column names.
 
-        This is the single source of truth consumed by the XGBoost
-        trainer and inference pipeline.  The target (``dk_points``) and
+        This is the single source of truth consumed by the XGBoost trainer
+        and inference pipeline.  The target (``dk_points_game``) and
         identifier / raw columns are excluded.
+
+        All features are computed at PA level and then carried through to
+        the game-level aggregation via the ``"last"`` rule, so their values
+        represent the batter's state *entering that game*.
 
         Returns:
             List of feature column name strings.
@@ -532,15 +714,17 @@ class FeatureEngineer:
         ]
 
         return [
-            # Rolling batter performance
+            # Rolling batter performance (pre-game trailing windows)
             *rolling_cols,
-            # Platoon
+            # Platoon matchup
             "platoon_advantage",
             "same_hand",
-            # Batting order
+            # Batting order slot
             "batting_order_multiplier",
             # Game context
             "run_diff",
             "is_close_game",
             "is_high_leverage",
+            # Game volume signal
+            "pa_count",
         ]

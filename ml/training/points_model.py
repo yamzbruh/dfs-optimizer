@@ -1,17 +1,19 @@
 """XGBoost quantile regression points projection model.
 
 Trains three separate XGBRegressor models — one for each quantile
-(q15 / q50 / q85) — on Statcast-derived batter features.  The three
-models together give a floor, median, and ceiling DK-points projection
-for every player on a slate.
+(q15 / q50 / q85) — on game-level batter features.  Each training row
+is one player-game; the target is ``dk_points_game`` — the total DK
+points that player scored across the entire game (hits + R + RBI + SB
++ walks + HBP).
 
-Quantile monotonicity is *not* guaranteed by XGBoost natively; it is
-enforced explicitly after prediction:
-
-    q15  ≤  q50  ≤  q85
+The three models give a floor, median, and ceiling projection for every
+player on a slate.  Quantile monotonicity (q15 ≤ q50 ≤ q85) is enforced
+explicitly after prediction.
 
 High ``interval_width`` (q85 − q15) signals high-variance players that
 are natural GPP targets for the optimizer.
+
+Feature matrix cache key: ``features/batter_feature_matrix_game_level``
 """
 
 from __future__ import annotations
@@ -59,19 +61,25 @@ XGBOOST_PARAMS: dict = {
     "enable_categorical": True,
 }
 
-# Columns that are never features: identifiers, raw inputs, and the target.
-_NON_FEATURE_COLS: frozenset[str] = frozenset(
-    {"batter", "game_date", "events", "dk_points", "pitcher", "player_name"}
-)
+# Columns that are never features: identifiers, raw inputs, and targets.
+_NON_FEATURE_COLS: frozenset[str] = frozenset({
+    "batter", "game_date", "events",
+    "dk_points", "dk_points_game",          # both target variants excluded
+    "runs", "rbi", "stolen_bases",           # game-log raw totals (in target)
+    "pitcher", "player_name",
+})
 
 
 class PointsModel:
     """Three XGBoost quantile regressors (q15 / q50 / q85) for DK points.
 
+    Trained on game-level data — one row per player per game — with
+    target ``dk_points_game`` (total DK score for that game).
+
     Usage::
 
         model = PointsModel()
-        metrics = model.train(years=[2023, 2024, 2025], test_year=2026)
+        metrics = model.train(years=[2023, 2024, 2025])
         run_path = model.save_models()
 
         # Later, at inference time:
@@ -104,7 +112,11 @@ class PointsModel:
         holdout_month: int = 5,
         force_rebuild_features: bool = False,
     ) -> dict:
-        """Train q15 / q50 / q85 quantile regressors.
+        """Train q15 / q50 / q85 quantile regressors on game-level data.
+
+        The feature matrix used is the game-level cache written by
+        ``FeatureEngineer.build_full_batter_feature_matrix()``.  Each row
+        is one player-game; the target is ``dk_points_game``.
 
         Args:
             years: All seasons to include in the feature matrix.
@@ -180,9 +192,9 @@ class PointsModel:
 
         self.feature_columns = present
         X_train = train_df[present].fillna(0.0)
-        y_train = train_df["dk_points"].fillna(0.0)
+        y_train = train_df["dk_points_game"].fillna(0.0)
         X_test = test_df[present].fillna(0.0) if not test_df.empty else pd.DataFrame()
-        y_test = test_df["dk_points"].fillna(0.0) if not test_df.empty else pd.Series(dtype=float)
+        y_test = test_df["dk_points_game"].fillna(0.0) if not test_df.empty else pd.Series(dtype=float)
 
         # -- d. Fit one model per quantile -----------------------------------
         raw_preds: dict[str, np.ndarray] = {}
@@ -322,7 +334,7 @@ class PointsModel:
             )
 
         if X_sample is None:
-            df = self._cache.load("features/batter_feature_matrix")
+            df = self._cache.load("features/batter_feature_matrix_game_level")
             if df is None or df.empty:
                 raise RuntimeError(
                     "Feature matrix not in cache — run train() first."
@@ -511,12 +523,12 @@ class PointsModel:
         train_years: list[int],
         force_rebuild: bool,
     ) -> pd.DataFrame | None:
-        """Load the cached feature matrix or rebuild it if needed."""
+        """Load the cached game-level feature matrix or rebuild it if needed."""
         if not force_rebuild:
-            df = self._cache.load("features/batter_feature_matrix")
+            df = self._cache.load("features/batter_feature_matrix_game_level")
             if df is not None and not df.empty:
                 logger.info(
-                    f"Loaded feature matrix from cache: {len(df):,} rows"
+                    f"Loaded game-level feature matrix from cache: {len(df):,} rows"
                 )
                 return df
 
