@@ -104,6 +104,54 @@ JOBS: list[PullJob] = [
         method="get_statcast_pitchers",
         kwargs={"year": 2024},
     ),
+    PullJob(
+        label="FanGraphs batting 2025",
+        key="fangraphs/batting_2025",
+        method="get_fangraphs_batting",
+        kwargs={"year": 2025},
+    ),
+    PullJob(
+        label="FanGraphs batting 2026",
+        key="fangraphs/batting_2026",
+        method="get_fangraphs_batting",
+        kwargs={"year": 2026},
+    ),
+    PullJob(
+        label="FanGraphs pitching 2025",
+        key="fangraphs/pitching_2025",
+        method="get_fangraphs_pitching",
+        kwargs={"year": 2025},
+    ),
+    PullJob(
+        label="FanGraphs pitching 2026",
+        key="fangraphs/pitching_2026",
+        method="get_fangraphs_pitching",
+        kwargs={"year": 2026},
+    ),
+    PullJob(
+        label="Statcast batters 2025",
+        key="statcast/batters_2025",
+        method="get_statcast_batters",
+        kwargs={"year": 2025},
+    ),
+    PullJob(
+        label="Statcast batters 2026",
+        key="statcast/batters_2026",
+        method="get_statcast_batters",
+        kwargs={"year": 2026},
+    ),
+    PullJob(
+        label="Statcast pitchers 2025",
+        key="statcast/pitchers_2025",
+        method="get_statcast_pitchers",
+        kwargs={"year": 2025},
+    ),
+    PullJob(
+        label="Statcast pitchers 2026",
+        key="statcast/pitchers_2026",
+        method="get_statcast_pitchers",
+        kwargs={"year": 2026},
+    ),
 ]
 
 

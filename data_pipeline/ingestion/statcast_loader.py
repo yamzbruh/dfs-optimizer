@@ -120,7 +120,7 @@ class StatcastLoader:
     ) -> pd.DataFrame:
         """Return FanGraphs season batting stats for ``year``.
 
-        Uses ``pybaseball.batting_stats(year)``.
+        Uses ``pybaseball.batting_stats(start_season, end_season, qual=0)``.
         Cache key: ``fangraphs/batting_{year}``.
 
         Args:
@@ -142,7 +142,7 @@ class StatcastLoader:
         try:
             from pybaseball import batting_stats  # noqa: PLC0415
 
-            df = batting_stats(year)
+            df = batting_stats(year, end_season=year, qual=0)
         except Exception as exc:  # noqa: BLE001
             logger.error(f"FanGraphs batting {year} failed: {exc}")
             return pd.DataFrame()
@@ -170,7 +170,7 @@ class StatcastLoader:
     ) -> pd.DataFrame:
         """Return FanGraphs season pitching stats for ``year``.
 
-        Uses ``pybaseball.pitching_stats(year)``.
+        Uses ``pybaseball.pitching_stats(start_season, end_season, qual=0)``.
         Cache key: ``fangraphs/pitching_{year}``.
 
         Args:
@@ -192,7 +192,7 @@ class StatcastLoader:
         try:
             from pybaseball import pitching_stats  # noqa: PLC0415
 
-            df = pitching_stats(year)
+            df = pitching_stats(year, end_season=year, qual=0)
         except Exception as exc:  # noqa: BLE001
             logger.error(f"FanGraphs pitching {year} failed: {exc}")
             return pd.DataFrame()
