@@ -33,15 +33,15 @@ from data_pipeline.loaders.parquet_cache import ParquetCache
 # immediately exploding.  Each method imports what it needs internally.
 # ---------------------------------------------------------------------------
 
-# DraftKings MLB batting scoring weights (partial — see docstring on
-# calculate_dk_points_batting for which components are omitted).
+# DraftKings MLB classic batting scoring weights (verified from DK rules).
+# Walk and HBP are 2.0 pts, not 3.0.  No strikeout penalty for hitters.
 _DK_BATTING_WEIGHTS: dict[str, float] = {
     "single": 3.0,
     "double": 5.0,
     "triple": 8.0,
     "home_run": 10.0,
-    "walk": 3.0,
-    "hit_by_pitch": 3.0,
+    "walk": 2.0,
+    "hit_by_pitch": 2.0,
 }
 
 
@@ -339,23 +339,16 @@ class StatcastLoader:
     def calculate_dk_points_batting(self, df: pd.DataFrame) -> pd.DataFrame:
         """Estimate DraftKings batting points from Statcast event data.
 
-        **Scoring applied (exact):**
+        **Scoring applied — verified from DK MLB classic rules:**
+
+        From pitch-by-pitch events (exact):
+
         - Single: +3 pts
         - Double: +5 pts
         - Triple: +8 pts
         - Home run: +10 pts
-        - Walk: +3 pts
-        - Hit by pitch: +3 pts
-
-        **Components intentionally omitted (require external data):**
-        - Runs scored (+2 pts): requires box-score join — not available
-          in Statcast pitch-by-pitch.
-        - RBIs (+2 pts): same reason.
-        - Stolen bases (+5 pts): ``stolen_base_2b`` / ``stolen_base_3b``
-          / ``stolen_base_home`` are Statcast event codes but are
-          not reliably populated in all seasons; excluded to avoid
-          silent undercounting.  Add a separate box-score enrichment
-          step when accuracy on those components is needed.
+        - Walk: +2 pts
+        - Hit by pitch: +2 pts
 
         Args:
             df: Statcast pitch-by-pitch DataFrame with an ``events``
@@ -381,6 +374,14 @@ class StatcastLoader:
         pts = pd.Series(0.0, index=result.index)
         for event, weight in _DK_BATTING_WEIGHTS.items():
             pts += (result["events"] == event).astype(float) * weight
+
+        # Add box-score components when available.
+        if "runs_scored" in result.columns:
+            pts += pd.to_numeric(result["runs_scored"], errors="coerce").fillna(0) * 2.0
+        if "rbi" in result.columns:
+            pts += pd.to_numeric(result["rbi"], errors="coerce").fillna(0) * 2.0
+        if "stolen_bases" in result.columns:
+            pts += pd.to_numeric(result["stolen_bases"], errors="coerce").fillna(0) * 5.0
 
         result["dk_points_batting"] = pts
         logger.info(

@@ -162,6 +162,7 @@ class LineupValidator:
             self._check_position_slots(slots),
             self._check_position_eligibility(lineup),
             self._check_min_games(players),
+            self._check_max_hitters_per_team(players),
             self._check_no_scratched(players),
             self._check_lineup_status_warning(players),
             self._check_no_banned(players),
@@ -353,6 +354,28 @@ class LineupValidator:
                 )
             ]
         return []
+
+    def _check_max_hitters_per_team(
+        self, players: list[DKPlayer]
+    ) -> list[ValidationError]:
+        """No more than 5 hitters from any single team (DK official rule)."""
+        team_hitter_counts: Counter = Counter(
+            p.team for p in players if not p.is_pitcher
+        )
+        errors: list[ValidationError] = []
+        for team, count in team_hitter_counts.items():
+            if count > 5:
+                errors.append(
+                    ValidationError(
+                        rule="max_hitters_per_team",
+                        message=(
+                            f"team {team} has {count} hitters; "
+                            "maximum allowed is 5"
+                        ),
+                        severity="error",
+                    )
+                )
+        return errors
 
     def _check_no_scratched(
         self, players: list[DKPlayer]

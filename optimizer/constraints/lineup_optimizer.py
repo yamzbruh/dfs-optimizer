@@ -276,6 +276,24 @@ class LineupOptimizer:
             )
         prob += pulp.lpSum(y.values()) >= 2, "min_games"
 
+        # -- DK rule: max 5 hitters from any single team ---------------------
+        hitter_teams = {
+            projections[i].player.team
+            for i in range(n)
+            if not projections[i].player.is_pitcher
+        }
+        for team in hitter_teams:
+            hitter_idx = [
+                i for i in range(n)
+                if projections[i].player.team == team
+                and not projections[i].player.is_pitcher
+            ]
+            if len(hitter_idx) > 5:
+                prob += (
+                    pulp.lpSum(x[i] for i in hitter_idx) <= 5,
+                    f"max_hitters_{team}",
+                )
+
         # -- Locked players --------------------------------------------------
         for i, proj in enumerate(projections):
             if proj.player.dk_id in _locked or proj.is_locked:

@@ -33,19 +33,17 @@ from data_pipeline.loaders.parquet_cache import ParquetCache  # noqa: E402
 # Constants
 # ---------------------------------------------------------------------------
 
-# DK MLB classic batting scoring (per plate-appearance event).
+# DK MLB classic batting scoring — verified from DK official rules.
+# Walk/HBP are 2.0 pts.  No strikeout penalty for hitters in DK MLB.
+# R (+2.0), RBI (+2.0), SB (+5.0) are applied in build_dk_points_labels()
+# when the box-score columns exist.
 _DK_EVENT_POINTS: dict[str, float] = {
     "single": 3.0,
     "double": 5.0,
     "triple": 8.0,
     "home_run": 10.0,
-    "walk": 3.0,
-    "hit_by_pitch": 3.0,
-    # Strikeout penalty — not part of standard DK scoring, but a
-    # useful negative signal for projection.  Included as an optional
-    # feature; downstream you can zero it out if you prefer strict DK
-    # scoring.
-    "strikeout": -0.5,
+    "walk": 2.0,
+    "hit_by_pitch": 2.0,
 }
 
 # Batting-order multipliers encode the expected PA-frequency boost or
@@ -339,18 +337,11 @@ class FeatureEngineer:
     def build_dk_points_labels(self, df: pd.DataFrame) -> pd.DataFrame:
         """Map Statcast ``events`` to DraftKings batting points.
 
-        Scoring applied:
+        Scoring applied — verified from DK MLB classic rules:
 
         * Single: +3 | Double: +5 | Triple: +8 | Home run: +10
-        * Walk: +3 | Hit by pitch: +3
-        * Strikeout: −0.5 (optional negative signal; not standard DK
-          scoring — set to 0 downstream if strict DK scoring is needed)
-
-        Components intentionally omitted (require box-score join):
-
-        * Runs scored (+2 pts) — not in Statcast pitch-by-pitch.
-        * RBIs (+2 pts) — same reason.
-        * Stolen bases (+5 pts) — see note in ``StatcastLoader``.
+        * Walk: +2 | Hit by pitch: +2
+        * No strikeout penalty for hitters in DK MLB
 
         Column added: ``dk_points`` (float, NaN rows filled with 0.0).
 
@@ -374,9 +365,22 @@ class FeatureEngineer:
             result["dk_points"] = 0.0
             return result
 
-        result["dk_points"] = (
-            result["events"].map(_DK_EVENT_POINTS).fillna(0.0)
-        )
+        result["dk_points"] = result["events"].map(_DK_EVENT_POINTS).fillna(0.0)
+
+        # Add box-score components when available.
+        if "runs_scored" in result.columns:
+            result["dk_points"] += pd.to_numeric(
+                result["runs_scored"], errors="coerce"
+            ).fillna(0) * 2.0
+        if "rbi" in result.columns:
+            result["dk_points"] += pd.to_numeric(
+                result["rbi"], errors="coerce"
+            ).fillna(0) * 2.0
+        if "stolen_bases" in result.columns:
+            result["dk_points"] += pd.to_numeric(
+                result["stolen_bases"], errors="coerce"
+            ).fillna(0) * 5.0
+
         logger.info(
             f"build_dk_points_labels: dk_points added  "
             f"total_pts={result['dk_points'].sum():.0f}"
@@ -455,10 +459,11 @@ class FeatureEngineer:
         1. ``load_statcast_years``
         2. ``build_rolling_batter_features``
         3. ``build_platoon_features``
-        4. ``build_game_context_features``
-        5. ``build_dk_points_labels``
-        6. Drop rows where ``dk_points`` is null.
-        7. Save to ``features/batter_feature_matrix``.
+        4. ``build_batting_order_features``
+        5. ``build_game_context_features``
+        6. ``build_dk_points_labels``
+        7. Drop rows where ``dk_points`` is null.
+        8. Save to ``features/batter_feature_matrix``.
 
         Args:
             years: Season years to include.  Defaults to
