@@ -51,6 +51,7 @@ logs/
 
 # ML artifacts
 mlruns/
+data/models/
 *.pkl
 *.joblib
 *.h5
