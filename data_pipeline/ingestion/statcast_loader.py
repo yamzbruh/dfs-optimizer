@@ -214,6 +214,326 @@ class StatcastLoader:
         return df
 
     # ------------------------------------------------------------------
+    # MLB Stats API — per-game hitting / pitching logs
+    # ------------------------------------------------------------------
+
+    def get_player_game_logs_hitting(
+        self,
+        mlbam_id: int,
+        season: int,
+    ) -> pd.DataFrame:
+        """Pull per-game hitting stats for one player via MLB Stats API.
+
+        Endpoint::
+
+            https://statsapi.mlb.com/api/v1/people/{mlbam_id}/stats
+            ?stats=gameLog&season={season}&group=hitting
+
+        Columns returned:
+
+        ``batter``, ``game_date``, ``game_pk``, ``runs``, ``rbi``,
+        ``stolen_bases``, ``hits``, ``doubles``, ``triples``,
+        ``home_runs``, ``walks``, ``hit_by_pitch``, ``at_bats``,
+        ``strike_outs``.
+
+        Args:
+            mlbam_id: MLB Advanced Media player id.
+            season: Season year.
+
+        Returns:
+            One row per game, or an empty DataFrame on error / no data.
+        """
+        url = (
+            f"https://statsapi.mlb.com/api/v1/people/{mlbam_id}/stats"
+            f"?stats=gameLog&season={season}&group=hitting"
+        )
+        try:
+            import requests  # noqa: PLC0415
+
+            resp = requests.get(url, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+
+            splits = (
+                data.get("stats", [{}])[0]
+                .get("splits", [])
+            )
+            if not splits:
+                return pd.DataFrame()
+
+            rows: list[dict] = []
+            for split in splits:
+                stat = split.get("stat", {})
+                game = split.get("game", {})
+                rows.append({
+                    "batter": mlbam_id,
+                    "game_date": pd.to_datetime(
+                        split.get("date", "")
+                    ),
+                    "game_pk": game.get("gamePk"),
+                    "runs": stat.get("runs", 0),
+                    "rbi": stat.get("rbi", 0),
+                    "stolen_bases": stat.get("stolenBases", 0),
+                    "hits": stat.get("hits", 0),
+                    "doubles": stat.get("doubles", 0),
+                    "triples": stat.get("triples", 0),
+                    "home_runs": stat.get("homeRuns", 0),
+                    "walks": stat.get("baseOnBalls", 0),
+                    "hit_by_pitch": stat.get("hitByPitch", 0),
+                    "at_bats": stat.get("atBats", 0),
+                    "strike_outs": stat.get("strikeOuts", 0),
+                })
+
+            return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                f"get_player_game_logs_hitting failed "
+                f"mlbam_id={mlbam_id} season={season}: {exc}"
+            )
+            return pd.DataFrame()
+
+    def get_player_game_logs_pitching(
+        self,
+        mlbam_id: int,
+        season: int,
+    ) -> pd.DataFrame:
+        """Pull per-game pitching stats for one player via MLB Stats API.
+
+        Endpoint::
+
+            https://statsapi.mlb.com/api/v1/people/{mlbam_id}/stats
+            ?stats=gameLog&season={season}&group=pitching
+
+        Columns returned:
+
+        ``pitcher``, ``game_date``, ``game_pk``, ``innings_pitched``,
+        ``outs_pitched``, ``strikeouts``, ``earned_runs``, ``hits_allowed``,
+        ``walks_allowed``, ``hit_batsmen``, ``wins``, ``complete_games``,
+        ``shutouts``, ``no_hitters``.
+
+        ``inningsPitched`` from the API is a string such as ``\"6.1\"``
+        (6 innings + 1 out).  It is converted to decimal innings
+        (e.g. ``6.333…``).
+
+        Args:
+            mlbam_id: MLB Advanced Media player id.
+            season: Season year.
+
+        Returns:
+            One row per appearance, or an empty DataFrame on error / no data.
+        """
+        url = (
+            f"https://statsapi.mlb.com/api/v1/people/{mlbam_id}/stats"
+            f"?stats=gameLog&season={season}&group=pitching"
+        )
+        try:
+            import requests  # noqa: PLC0415
+
+            resp = requests.get(url, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+
+            splits = (
+                data.get("stats", [{}])[0]
+                .get("splits", [])
+            )
+            if not splits:
+                return pd.DataFrame()
+
+            rows: list[dict] = []
+            for split in splits:
+                stat = split.get("stat", {})
+                game = split.get("game", {})
+
+                ip_str = str(stat.get("inningsPitched", "0.0"))
+                try:
+                    parts = ip_str.split(".")
+                    full_innings = int(parts[0])
+                    extra_outs = int(parts[1]) if len(parts) > 1 else 0
+                    ip_decimal = full_innings + extra_outs / 3
+                except Exception:  # noqa: BLE001
+                    ip_decimal = 0.0
+
+                rows.append({
+                    "pitcher": mlbam_id,
+                    "game_date": pd.to_datetime(
+                        split.get("date", "")
+                    ),
+                    "game_pk": game.get("gamePk"),
+                    "innings_pitched": ip_decimal,
+                    "outs_pitched": stat.get("outs", 0),
+                    "strikeouts": stat.get("strikeOuts", 0),
+                    "earned_runs": stat.get("earnedRuns", 0),
+                    "hits_allowed": stat.get("hits", 0),
+                    "walks_allowed": stat.get("baseOnBalls", 0),
+                    "hit_batsmen": stat.get("hitByPitch", 0),
+                    "wins": 1 if stat.get("wins", 0) > 0 else 0,
+                    "complete_games": stat.get("completeGames", 0),
+                    "shutouts": stat.get("shutouts", 0),
+                    "no_hitters": stat.get("noHitters", 0),
+                })
+
+            return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                f"get_player_game_logs_pitching failed "
+                f"mlbam_id={mlbam_id} season={season}: {exc}"
+            )
+            return pd.DataFrame()
+
+    def get_season_game_logs_hitting(
+        self,
+        season: int,
+        mlbam_ids: list[int],
+        force_refresh: bool = False,
+    ) -> pd.DataFrame:
+        """Pull per-game hitting stats for all listed players in a season.
+
+        Calls :meth:`get_player_game_logs_hitting` for each MLBAM id,
+        concatenates, and caches under ``gamelogs/hitting_{season}``.
+
+        Rate limit: ``0.05`` s sleep between requests.  Uses ``tqdm``
+        for progress.
+
+        Args:
+            season: Season year.
+            mlbam_ids: Distinct batter MLBAM ids (e.g. from Statcast cache).
+            force_refresh: When ``True``, ignore cache and re-pull.
+
+        Returns:
+            Combined DataFrame, or empty if nothing was retrieved.
+        """
+        import time as time_module  # noqa: PLC0415
+
+        from tqdm import tqdm  # noqa: PLC0415
+
+        cache_key = f"gamelogs/hitting_{season}"
+
+        if not force_refresh and self.cache.exists(cache_key):
+            df = self.cache.load(cache_key)
+            if df is not None and not df.empty:
+                logger.info(
+                    f"Loaded hitting game logs from cache: "
+                    f"{cache_key} ({len(df):,} rows)"
+                )
+                return df
+
+        logger.info(
+            f"Pulling hitting game logs: {len(mlbam_ids)} "
+            f"players, season={season}"
+        )
+
+        frames: list[pd.DataFrame] = []
+        for mlbam_id in tqdm(mlbam_ids, desc=f"Hitting logs {season}"):
+            df_one = self.get_player_game_logs_hitting(mlbam_id, season)
+            if not df_one.empty:
+                frames.append(df_one)
+            time_module.sleep(0.05)
+
+        if not frames:
+            logger.warning(
+                f"get_season_game_logs_hitting: no data for {season}"
+            )
+            return pd.DataFrame()
+
+        combined = pd.concat(frames, ignore_index=True)
+        combined["game_date"] = pd.to_datetime(combined["game_date"])
+
+        self.cache.save(
+            combined,
+            cache_key,
+            metadata={
+                "season": season,
+                "players": len(mlbam_ids),
+                "rows": len(combined),
+                "type": "game_logs_hitting",
+            },
+        )
+
+        logger.info(
+            f"Hitting game logs {season}: {len(combined):,} rows "
+            f"for {len(mlbam_ids)} players"
+        )
+        return combined
+
+    def get_season_game_logs_pitching(
+        self,
+        season: int,
+        mlbam_ids: list[int],
+        force_refresh: bool = False,
+    ) -> pd.DataFrame:
+        """Pull per-game pitching stats for all listed players in a season.
+
+        Calls :meth:`get_player_game_logs_pitching` for each MLBAM id,
+        concatenates, and caches under ``gamelogs/pitching_{season}``.
+
+        Rate limit: ``0.05`` s sleep between requests.  Uses ``tqdm``
+        for progress.
+
+        Args:
+            season: Season year.
+            mlbam_ids: Distinct pitcher MLBAM ids (e.g. from Statcast cache).
+            force_refresh: When ``True``, ignore cache and re-pull.
+
+        Returns:
+            Combined DataFrame, or empty if nothing was retrieved.
+        """
+        import time as time_module  # noqa: PLC0415
+
+        from tqdm import tqdm  # noqa: PLC0415
+
+        cache_key = f"gamelogs/pitching_{season}"
+
+        if not force_refresh and self.cache.exists(cache_key):
+            df = self.cache.load(cache_key)
+            if df is not None and not df.empty:
+                logger.info(
+                    f"Loaded pitching game logs from cache: "
+                    f"{cache_key} ({len(df):,} rows)"
+                )
+                return df
+
+        logger.info(
+            f"Pulling pitching game logs: {len(mlbam_ids)} "
+            f"players, season={season}"
+        )
+
+        frames: list[pd.DataFrame] = []
+        for mlbam_id in tqdm(mlbam_ids, desc=f"Pitching logs {season}"):
+            df_one = self.get_player_game_logs_pitching(mlbam_id, season)
+            if not df_one.empty:
+                frames.append(df_one)
+            time_module.sleep(0.05)
+
+        if not frames:
+            logger.warning(
+                f"get_season_game_logs_pitching: no data for {season}"
+            )
+            return pd.DataFrame()
+
+        combined = pd.concat(frames, ignore_index=True)
+        combined["game_date"] = pd.to_datetime(combined["game_date"])
+
+        self.cache.save(
+            combined,
+            cache_key,
+            metadata={
+                "season": season,
+                "players": len(mlbam_ids),
+                "rows": len(combined),
+                "type": "game_logs_pitching",
+            },
+        )
+
+        logger.info(
+            f"Pitching game logs {season}: {len(combined):,} rows "
+            f"for {len(mlbam_ids)} players"
+        )
+        return combined
+
+    # ------------------------------------------------------------------
     # Derived features
     # ------------------------------------------------------------------
 
