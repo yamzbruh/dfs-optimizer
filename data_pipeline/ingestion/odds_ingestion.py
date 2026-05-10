@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -50,8 +50,10 @@ class OddsIngestion:
     ) -> pd.DataFrame:
         """Pull implied team totals for today's MLB games.
 
-        Calls ``/sports/baseball_mlb/odds`` with ``markets=totals,h2h,spreads``
-        and ``bookmakers=draftkings,fanduel,betmgm``.
+        Calls ``/sports/baseball_mlb/odds`` with ``markets=totals,h2h,spreads``,
+        ``bookmakers=draftkings,fanduel,betmgm``, and a UTC window
+        ``commenceTimeFrom`` / ``commenceTimeTo`` (now through +24h) so only
+        pre-game / upcoming events are returned.
 
         Returns a DataFrame with one row per team per game and columns:
             game_id, home_team, away_team, team, is_home, commence_time,
@@ -85,12 +87,17 @@ class OddsIngestion:
             return _ODDS_SESSION_DF.copy()
 
         url = f"{ODDS_BASE_URL}/sports/{SPORT}/odds"
+        now_utc = datetime.now(timezone.utc)
         params = {
             "apiKey": ODDS_API_KEY,
             "regions": "us",
             "markets": "totals,h2h,spreads",
             "oddsFormat": "american",
             "bookmakers": "draftkings,fanduel,betmgm",
+            "commenceTimeFrom": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "commenceTimeTo": (now_utc + timedelta(hours=24)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            ),
         }
 
         try:
@@ -203,6 +210,14 @@ class OddsIngestion:
                         if pt is not None:
                             home_spread = float(pt)
                         break
+
+                if abs(home_spread) > 3.0:
+                    logger.warning(
+                        f"Extreme spread {home_spread} detected for "
+                        f"{home_team} @ {away_team} — "
+                        f"likely live odds, defaulting to even split"
+                    )
+                    home_spread = 0.0
 
                 home_implied = (game_total - home_spread) / 2.0
                 away_implied = (game_total + home_spread) / 2.0
