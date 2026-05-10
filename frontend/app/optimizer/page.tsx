@@ -4,6 +4,16 @@ import { useState } from "react";
 import { useSlate } from "@/app/context/SlateContext";
 import LockBanPanel from "@/components/LockBanPanel";
 
+function formatSimsK(n: number): string {
+  if (n >= 1000) {
+    const k = n / 1000;
+    const s =
+      n % 1000 === 0 ? String(Math.round(k)) : k.toFixed(1).replace(/\.0$/, "");
+    return `${s}k`;
+  }
+  return String(n);
+}
+
 export default function OptimizerPage() {
   const {
     playerPool,
@@ -14,13 +24,18 @@ export default function OptimizerPage() {
     banPlayer,
     unbanPlayer,
     generateLineups,
+    projectOwnership,
     loading,
     error,
+    ownershipSimsApplied,
   } = useSlate();
 
   const [maxExposure, setMaxExposure] = useState(70);
   const [nLineups, setNLineups] = useState(20);
   const [generated, setGenerated] = useState(false);
+  const [ownershipSims, setOwnershipSims] = useState(10000);
+  const [ownershipRunActive, setOwnershipRunActive] = useState(false);
+  const [ownershipNotice, setOwnershipNotice] = useState<string | null>(null);
 
   const lockedArr = Array.from(lockedIds);
   const bannedArr = Array.from(bannedIds);
@@ -34,6 +49,19 @@ export default function OptimizerPage() {
     (a, b) =>
       b.proj_pts_q85 - b.proj_pts - (a.proj_pts_q85 - a.proj_pts)
   ).slice(0, 8);
+
+  async function handleOwnership() {
+    setOwnershipNotice(null);
+    setOwnershipRunActive(true);
+    try {
+      const n = await projectOwnership(ownershipSims);
+      if (n !== undefined) {
+        setOwnershipNotice(`Ownership updated — ${n} players repriced`);
+      }
+    } finally {
+      setOwnershipRunActive(false);
+    }
+  }
 
   async function handleGenerate() {
     setGenerated(false);
@@ -51,7 +79,9 @@ export default function OptimizerPage() {
           <div className="flex flex-col items-center gap-3">
             <span className="inline-block w-10 h-10 border-2 border-slate-600 border-t-[#00ff88] rounded-full animate-spin" />
             <span className="text-xs uppercase tracking-widest text-slate-400">
-              Optimizer running…
+              {loading && ownershipRunActive
+                ? `Running ${ownershipSims.toLocaleString()} Monte Carlo ownership sims…`
+                : "Optimizer running…"}
             </span>
           </div>
         </div>
@@ -170,6 +200,77 @@ export default function OptimizerPage() {
               </div>
             )}
           </div>
+
+          <div style={{ borderTop: "1px solid #1e2d4a" }} />
+
+          {/* Ownership proxy */}
+          <div className="flex flex-col gap-3">
+            <h3 className="text-xs font-semibold uppercase tracking-widest text-slate-500">
+              Ownership
+            </h3>
+            <p className="text-xs text-slate-500 leading-relaxed">
+              {ownershipSimsApplied === null
+                ? "Using flat ownership estimates"
+                : `Using simulated ownership (${formatSimsK(
+                    ownershipSimsApplied
+                  )} sims)`}
+            </p>
+            <div className="flex flex-col gap-2">
+              <div className="flex justify-between text-xs">
+                <span className="text-slate-400">Simulation draws</span>
+                <span
+                  className="font-data font-semibold"
+                  style={{ color: "#00ff88" }}
+                >
+                  {ownershipSims.toLocaleString()}
+                </span>
+              </div>
+              <input
+                type="range"
+                min={1000}
+                max={10000}
+                step={1000}
+                value={ownershipSims}
+                onChange={(e) => setOwnershipSims(Number(e.target.value))}
+                disabled={loading || playerPool.length === 0}
+                className="w-full accent-green-400"
+              />
+              <span className="text-[10px] text-slate-600">
+                1k fast · 10k accurate (2–3 min)
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => void handleOwnership()}
+              disabled={
+                loading || playerPool.length === 0 || ownershipRunActive
+              }
+              className="w-full py-3 rounded-lg font-semibold text-sm tracking-wide transition-all duration-150 flex items-center justify-center gap-2"
+              style={{
+                backgroundColor:
+                  loading || playerPool.length === 0 ? "#1e2d4a" : "#1e4d6b",
+                color:
+                  loading || playerPool.length === 0 ? "#475569" : "#e2e8f0",
+                cursor:
+                  loading || playerPool.length === 0
+                    ? "not-allowed"
+                    : "pointer",
+                border: "1px solid #1e2d4a",
+              }}
+            >
+              Run Ownership Sims (2–3 min)
+            </button>
+            {ownershipNotice && !loading && (
+              <div
+                className="text-xs text-center font-data"
+                style={{ color: "#00ff88" }}
+              >
+                {ownershipNotice}
+              </div>
+            )}
+          </div>
+
+          <div style={{ borderTop: "1px solid #1e2d4a" }} />
 
           {/* Generate button */}
           <button

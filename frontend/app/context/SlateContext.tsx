@@ -262,10 +262,13 @@ interface SlateContextValue {
   slateInfo: SlateInfo | null;
   lockedIds: Set<string>;
   bannedIds: Set<string>;
+  /** Set after successful POST /api/ownership; ``null`` if still flat defaults */
+  ownershipSimsApplied: number | null;
   /** Merged projection + roster rows for tables and charts */
   playerPool: Player[];
   uploadCSV: (file: File) => Promise<boolean>;
   generateProjections: () => Promise<void>;
+  projectOwnership: (nSims?: number) => Promise<number | undefined>;
   generateLineups: (n: number, maxExposurePct?: number) => Promise<boolean>;
   exportLineups: () => Promise<void>;
   lockPlayer: (dk_id: string) => void;
@@ -288,6 +291,10 @@ export function SlateProvider({ children }: { children: ReactNode }) {
   const [slateInfo, setSlateInfo] = useState<SlateInfo | null>(null);
   const [lockedIds, setLockedIds] = useState<Set<string>>(() => new Set());
   const [bannedIds, setBannedIds] = useState<Set<string>>(() => new Set());
+  /** Last ``n_sims`` used by POST /api/ownership; ``null`` = flat defaults only */
+  const [ownershipSimsApplied, setOwnershipSimsApplied] = useState<number | null>(
+    null
+  );
 
   const rosterMap = useMemo(() => {
     const m = new Map<string, PlayerResponse>();
@@ -352,6 +359,7 @@ export function SlateProvider({ children }: { children: ReactNode }) {
         setLineups([]);
         setLockedIds(new Set());
         setBannedIds(new Set());
+        setOwnershipSimsApplied(null);
         const firstGi = data.players.find((p) => p.game_info)?.game_info ?? "";
         const lockIso = parseLockIsoFromGameInfo(firstGi);
         const dispDate = displayDateFromGameInfo(firstGi);
@@ -388,8 +396,28 @@ export function SlateProvider({ children }: { children: ReactNode }) {
       if (!res.ok) throw new Error(await readApiError(res));
       const list = (await res.json()) as ProjectionResponse[];
       setProjections(list);
+      setOwnershipSimsApplied(null);
     });
   }, [withRequest]);
+
+  const projectOwnership = useCallback(
+    async (nSims: number = 10000): Promise<number | undefined> => {
+      const clamped = Math.max(1000, Math.min(nSims, 10000));
+      return await withRequest(async () => {
+        const resp = await fetch(
+          `${API_BASE}/api/ownership?n_sims=${clamped}`,
+          { method: "POST" }
+        );
+        if (!resp.ok) throw new Error(await readApiError(resp));
+        const data = (await resp.json()) as ProjectionResponse[];
+        setProjections(data);
+        setOwnershipSimsApplied(clamped);
+        setLineups([]);
+        return data.length;
+      });
+    },
+    [withRequest]
+  );
 
   const generateLineups = useCallback(
     async (n: number, maxExposurePct = 70): Promise<boolean> => {
@@ -501,9 +529,11 @@ export function SlateProvider({ children }: { children: ReactNode }) {
       slateInfo,
       lockedIds,
       bannedIds,
+      ownershipSimsApplied,
       playerPool,
       uploadCSV,
       generateProjections,
+      projectOwnership,
       generateLineups,
       exportLineups,
       lockPlayer,
@@ -523,9 +553,11 @@ export function SlateProvider({ children }: { children: ReactNode }) {
       slateInfo,
       lockedIds,
       bannedIds,
+      ownershipSimsApplied,
       playerPool,
       uploadCSV,
       generateProjections,
+      projectOwnership,
       generateLineups,
       exportLineups,
       lockPlayer,

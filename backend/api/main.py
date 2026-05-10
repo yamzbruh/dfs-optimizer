@@ -5,6 +5,7 @@ Endpoints
 * ``POST /api/upload`` — upload DK salary CSV, parse, return player pool
 * ``POST /api/projections`` — build projections for parsed players (DK avg
   proxy until full slate feature inference is wired in V2)
+* ``POST /api/ownership`` — Monte Carlo ownership proxy (optional; replaces flat 10%/15%)
 * ``POST /api/optimize`` — generate lineups from current projections
 * ``GET /api/model-info`` — loaded model metadata and feature column lists
 * ``POST /api/export`` — export current lineups as DK upload CSV
@@ -20,7 +21,7 @@ import tempfile
 from dataclasses import replace
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from loguru import logger
@@ -33,6 +34,7 @@ if str(_ROOT) not in sys.path:
 
 from data_pipeline.ingestion.dk_csv_exporter import DKLineupExporter  # noqa: E402
 from data_pipeline.ingestion.dk_csv_parser import DKCSVParser, DKPlayer  # noqa: E402
+from ml.features.ownership_projector import OwnershipProjector  # noqa: E402
 from ml.training.points_model import PitcherPointsModel, PointsModel  # noqa: E402
 from optimizer.constraints.lineup_optimizer import (  # noqa: E402
     LineupOptimizer,
@@ -65,6 +67,8 @@ _current_players: list[DKPlayer] = []
 _current_projections: list[PlayerProjection] = []
 _current_lineups: list[LineupResult] = []
 _upload_meta: dict = {}
+
+_ownership_projector: OwnershipProjector | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -168,40 +172,48 @@ async def load_models() -> None:
     under ``data/models/``, picks the lexicographically last stem (timestamp
     runs sort correctly).  Failures are logged but do not crash the app.
     """
-    global _hitter_model, _pitcher_model
+    global _hitter_model, _pitcher_model, _ownership_projector
 
     models_dir = Path("data/models")
-    if not models_dir.is_dir():
+    if models_dir.is_dir():
+        try:
+            hitter_files = sorted(models_dir.glob("points_q50_*.joblib"))
+            if hitter_files:
+                stem = hitter_files[-1].stem
+                run_id = stem.replace("points_q50_", "", 1)
+                _hitter_model = PointsModel()
+                _hitter_model.load_models(run_id)
+                logger.info(f"Loaded hitter models  run_id={run_id}")
+            else:
+                logger.warning("No hitter model files found (points_q50_*.joblib)")
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"Failed to load hitter models: {exc}")
+            _hitter_model = None
+
+        try:
+            pitcher_files = sorted(models_dir.glob("pitcher_q50_*.joblib"))
+            if pitcher_files:
+                stem = pitcher_files[-1].stem
+                run_id = stem.replace("pitcher_q50_", "", 1)
+                _pitcher_model = PitcherPointsModel()
+                _pitcher_model.load_models(run_id)
+                logger.info(f"Loaded pitcher models  run_id={run_id}")
+            else:
+                logger.warning(
+                    "No pitcher model files found (pitcher_q50_*.joblib)"
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"Failed to load pitcher models: {exc}")
+            _pitcher_model = None
+    else:
         logger.warning(f"Models directory missing: {models_dir}")
-        return
 
     try:
-        hitter_files = sorted(models_dir.glob("points_q50_*.joblib"))
-        if hitter_files:
-            stem = hitter_files[-1].stem
-            run_id = stem.replace("points_q50_", "", 1)
-            _hitter_model = PointsModel()
-            _hitter_model.load_models(run_id)
-            logger.info(f"Loaded hitter models  run_id={run_id}")
-        else:
-            logger.warning("No hitter model files found (points_q50_*.joblib)")
+        _ownership_projector = OwnershipProjector()
+        logger.info("OwnershipProjector initialized")
     except Exception as exc:  # noqa: BLE001
-        logger.error(f"Failed to load hitter models: {exc}")
-        _hitter_model = None
-
-    try:
-        pitcher_files = sorted(models_dir.glob("pitcher_q50_*.joblib"))
-        if pitcher_files:
-            stem = pitcher_files[-1].stem
-            run_id = stem.replace("pitcher_q50_", "", 1)
-            _pitcher_model = PitcherPointsModel()
-            _pitcher_model.load_models(run_id)
-            logger.info(f"Loaded pitcher models  run_id={run_id}")
-        else:
-            logger.warning("No pitcher model files found (pitcher_q50_*.joblib)")
-    except Exception as exc:  # noqa: BLE001
-        logger.error(f"Failed to load pitcher models: {exc}")
-        _pitcher_model = None
+        logger.error(f"Failed to init OwnershipProjector: {exc}")
+        _ownership_projector = None
 
 
 def _opponent_for_player(p: DKPlayer) -> str:
@@ -319,6 +331,9 @@ async def generate_projections() -> list[ProjectionResponse]:
     ``PitcherPointsModel.predict``; for now quantiles are derived from
     ``AvgPointsPerGame`` so the dashboard and optimizer stay usable
     without a full inference pipeline on every slate upload.
+
+    Ownership defaults to flat 10% (hitters) / 15% (pitchers) until
+    ``POST /api/ownership`` runs the Monte Carlo ownership proxy.
     """
     global _current_projections
 
@@ -380,6 +395,82 @@ async def generate_projections() -> list[ProjectionResponse]:
     )
 
     return responses
+
+
+@app.post("/api/ownership", response_model=list[ProjectionResponse])
+async def project_ownership(
+    n_sims: int = Query(default=10000, ge=1000, le=10000),
+) -> list[ProjectionResponse]:
+    """Run ownership projection for the current slate.
+
+    Runs Monte Carlo sims + Vegas totals + value scores (several minutes at
+    high ``n_sims``). Updates in-memory projections with ``ownership_proj``
+    and ``leverage_score``. Safe to skip — lineups still work with flat
+    ownership from ``/api/projections`` until this is called.
+
+    Args:
+        n_sims: Monte Carlo lineup draws for the frequency backbone (1k–10k).
+    """
+    global _current_projections, _current_lineups
+
+    if not _current_projections:
+        raise HTTPException(
+            status_code=400,
+            detail="No projections available. Call POST /api/projections first.",
+        )
+
+    if _ownership_projector is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Ownership projector not initialized.",
+        )
+
+    try:
+        logger.info(f"Running ownership projection ({n_sims} sims)...")
+
+        players = [p.player for p in _current_projections]
+
+        ownership = _ownership_projector.project(
+            players=players,
+            base_projections=_current_projections,
+            n_sims=n_sims,
+            n_jobs=4,
+        )
+
+        updated = _ownership_projector.update_projections_with_ownership(
+            _current_projections,
+            ownership,
+        )
+
+        _current_projections = updated
+        _current_lineups = []
+
+        logger.info(
+            f"Ownership projection complete for {len(updated)} players"
+        )
+
+        return [
+            ProjectionResponse(
+                dk_id=p.player.dk_id,
+                name=p.player.name,
+                team=p.player.team,
+                position=_primary_slot_label(p.player),
+                salary=p.player.salary,
+                pts_q15=p.pts_q15,
+                pts_q50=p.pts_q50,
+                pts_q85=p.pts_q85,
+                ownership_proj=p.ownership_proj,
+                leverage_score=p.leverage_score,
+                is_pitcher=p.player.is_pitcher,
+            )
+            for p in updated
+        ]
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Ownership projection failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/api/optimize", response_model=list[LineupResponse])
