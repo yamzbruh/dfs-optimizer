@@ -1,11 +1,15 @@
 """PuLP / HiGHS linear-programming lineup optimizer.
 
-Generates up to 20 diverse DraftKings MLB classic lineups from a list
-of ``PlayerProjection`` objects.  Each lineup is a feasible solution
-to an integer linear program (ILP) that respects the DK salary cap,
-position-slot requirements, dual-eligibility rules, minimum-game
-diversity, and a stacking overlap penalty that prevents the solver from
-regenerating the same lineup on successive calls.
+Generates DraftKings MLB classic lineups from ``PlayerProjection`` rows.
+
+**Default path — Monte Carlo:** many independent ILP solves, each on a
+random draw from each player's quantile band (truncated normal around
+``pts_q50``).  Lineups are deduplicated, scored on *original* projections,
+exposure-filtered, and the top ``N`` are returned.  No sequential diversity
+constraints, so late lineups are not starved.
+
+**Fallback — sequential:** repeated ``optimize_single`` calls with overlap
+penalties versus all prior lineups (legacy behaviour).
 
 Solver hierarchy
 ----------------
@@ -22,7 +26,7 @@ CPU cores inside the solver.  ``msg=0`` silences all solver stdout.
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -94,6 +98,28 @@ class LineupResult:
             self.player_dk_ids = {p.dk_id for p, _ in self.players}
 
 
+def _monte_carlo_single_simulation(
+    optimizer: "LineupOptimizer",
+    projections: list[PlayerProjection],
+    seed: int,
+    locked_ids: set[str],
+    banned_ids: set[str],
+) -> LineupResult | None:
+    """One Monte Carlo draw + single ILP solve (picklable worker for joblib)."""
+    try:
+        sim_projs = optimizer.simulate_projections(projections, seed=seed)
+        return optimizer.optimize_single(
+            projections=sim_projs,
+            locked_ids=locked_ids or None,
+            banned_ids=banned_ids or None,
+            previous_lineups=None,
+            min_overlap_penalty=10,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"Monte Carlo sim seed={seed} failed: {exc}")
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -112,7 +138,7 @@ def _game_key(player: DKPlayer) -> str:
 
 
 class LineupOptimizer:
-    """Generates diverse DK MLB classic lineups via integer linear programming.
+    """DK MLB classic lineups via ILP (Monte Carlo by default).
 
     Usage::
 
@@ -483,35 +509,40 @@ class LineupOptimizer:
             for proj in selected
         ]
 
-    def generate_lineups(
+    def _generate_lineups_sequential(
         self,
         projections: list[PlayerProjection],
-        n_lineups: int = 20,
+        n_lineups: int,
         locked_ids: set[str] | None = None,
         banned_ids: set[str] | None = None,
+        *,
+        seed_previous: list[LineupResult] | None = None,
     ) -> list[LineupResult]:
-        """Generate ``n_lineups`` diverse and valid lineups.
+        """Sequential PuLP solves with diversity overlap vs. all prior lineups.
 
-        Calls ``optimize_single`` sequentially, passing all previously
-        generated lineups as diversity constraints so each new lineup
-        is forced to differ from every prior one.
+        Each call to :meth:`optimize_single` sees ``previous_lineups`` equal to
+        every lineup accumulated so far (including ``seed_previous`` when set).
+
+        When ``seed_previous`` is provided, those rows are used only as
+        diversity anchors; the returned list contains **only** the newly
+        appended lineups (not the seed rows).
 
         Args:
             projections: Full slate player pool with projections.
-            n_lineups: Number of lineups to generate (default 20).
-            locked_ids: Players that must appear in every lineup.
+            n_lineups: Number of **new** sequential solve attempts.
+            locked_ids: Players forced into every lineup.
             banned_ids: Players excluded from every lineup.
+            seed_previous: Optional lineups to treat as already generated.
 
         Returns:
-            List of valid ``LineupResult`` objects (may be fewer than
-            ``n_lineups`` if the pool is too shallow or the solver
-            times out repeatedly).
+            New ``LineupResult`` rows only (empty list if ``n_lineups`` is 0).
         """
         if not projections:
-            logger.warning("generate_lineups: empty projections list")
+            logger.warning("_generate_lineups_sequential: empty projections list")
             return []
 
-        results: list[LineupResult] = []
+        results: list[LineupResult] = list(seed_previous) if seed_previous else []
+        prev_len = len(results)
 
         for attempt in range(1, n_lineups + 1):
             result = self.optimize_single(
@@ -522,10 +553,11 @@ class LineupOptimizer:
             )
 
             if result is None:
-                logger.warning(f"Lineup {attempt}/{n_lineups}: solver returned None — skipping")
+                logger.warning(
+                    f"Lineup {attempt}/{n_lineups}: solver returned None — skipping"
+                )
                 continue
 
-            # Validate through the rule engine.
             validated = self._validator.validate(result.players)
             result.is_valid = validated.is_valid
 
@@ -541,18 +573,71 @@ class LineupOptimizer:
 
             results.append(result)
             logger.info(
-                f"Lineup {attempt:>2}/{n_lineups}: "
+                f"Lineup seq {len(results) - prev_len:>2}/{n_lineups}: "
                 f"salary=${result.total_salary:,}  "
                 f"pts={result.projected_pts:.2f}  "
                 f"valid={result.is_valid}"
             )
 
-        valid_count = sum(1 for r in results if r.is_valid)
+        new_tail = results[prev_len:] if seed_previous is not None else results
+        valid_count = sum(1 for r in new_tail if r.is_valid)
         logger.info(
-            f"generate_lineups complete: {valid_count} valid of "
-            f"{len(results)} generated (target={n_lineups})"
+            f"_generate_lineups_sequential: {valid_count} valid of "
+            f"{len(new_tail)} new lineups (attempts={n_lineups}, seed={prev_len})"
         )
-        return results
+        return new_tail
+
+    def generate_lineups(
+        self,
+        projections: list[PlayerProjection],
+        n_lineups: int = 20,
+        locked_ids: set[str] | None = None,
+        banned_ids: set[str] | None = None,
+        *,
+        use_monte_carlo: bool = True,
+        n_simulations: int = 500,
+    ) -> list[LineupResult]:
+        """Generate lineups using Monte Carlo (default) or sequential ILP.
+
+        Monte Carlo is the default: many independent solves on sampled
+        projections, deduplication, scoring on original quantiles, exposure
+        filtering, optional sequential top-up. Sequential mode preserves the
+        legacy diversity-constraint ladder.
+
+        Args:
+            projections: Full slate player pool with projections.
+            n_lineups: Number of lineups to return.
+            locked_ids: Players that must appear in every lineup.
+            banned_ids: Players excluded from every lineup.
+            use_monte_carlo: Use :meth:`run_monte_carlo` when ``True``.
+            n_simulations: Monte Carlo draw count when MC is enabled.
+
+        Returns:
+            Up to ``n_lineups`` ``LineupResult`` instances (possibly fewer).
+        """
+        if not projections:
+            logger.warning("generate_lineups: empty projections list")
+            return []
+
+        if n_lineups <= 0:
+            return []
+
+        if use_monte_carlo:
+            return self.run_monte_carlo(
+                projections=projections,
+                n_lineups=n_lineups,
+                n_simulations=n_simulations,
+                locked_ids=locked_ids,
+                banned_ids=banned_ids,
+            )
+
+        return self._generate_lineups_sequential(
+            projections=projections,
+            n_lineups=n_lineups,
+            locked_ids=locked_ids,
+            banned_ids=banned_ids,
+            seed_previous=None,
+        )
 
     def calculate_portfolio_score(
         self,
@@ -592,6 +677,260 @@ class LineupOptimizer:
 
         return lineup.projected_pts + (leverage_bonus * 1.2) - (ownership_penalty * 0.1)
 
+    def simulate_projections(
+        self,
+        projections: list[PlayerProjection],
+        seed: int | None = None,
+    ) -> list[PlayerProjection]:
+        """Draw one simulated projection for each player.
+
+        For each player, sample a random DK points value from a truncated
+        normal distribution defined by their quantile predictions:
+
+        - mean = ``pts_q50``
+        - std = ``(pts_q85 - pts_q15) / (2 * 1.04)`` — the 1.04 factor maps
+          the q15–q85 interval to roughly ±1 standard deviation.
+
+        The draw is truncated at ``0`` (no negative scores) and at
+        ``max(pts_q85 * 1.5, mean + std)`` to cap extreme outliers.
+
+        Returns a new list of ``PlayerProjection`` with ``pts_q50`` replaced
+        by the simulated value; ``pts_q15`` and ``pts_q85`` are preserved for
+        downstream portfolio scoring on the original slate.
+
+        Args:
+            projections: Original projections with q15 / q50 / q85.
+            seed: Optional RNG seed for reproducibility.
+
+        Returns:
+            New list of projections with sampled ``pts_q50`` only.
+        """
+        from scipy import stats
+
+        rng = np.random.default_rng(seed)
+        simulated: list[PlayerProjection] = []
+
+        for proj in projections:
+            mean = proj.pts_q50
+            interval = proj.pts_q85 - proj.pts_q15
+            std = max(interval / (2 * 1.04), 0.01)
+
+            low = 0.0
+            high = max(proj.pts_q85 * 1.5, mean + std)
+
+            a = (low - mean) / std
+            b = (high - mean) / std
+            if b <= a:
+                b = a + 1e-6
+
+            sampled = float(
+                stats.truncnorm.rvs(a, b, loc=mean, scale=std, random_state=rng)
+            )
+
+            simulated.append(
+                replace(
+                    proj,
+                    pts_q50=sampled,
+                )
+            )
+
+        return simulated
+
+    def run_monte_carlo(
+        self,
+        projections: list[PlayerProjection],
+        n_lineups: int = 20,
+        n_simulations: int = 500,
+        locked_ids: set[str] | None = None,
+        banned_ids: set[str] | None = None,
+        n_jobs: int = 4,
+    ) -> list[LineupResult]:
+        """Generate diverse lineups via Monte Carlo simulation.
+
+        Algorithm:
+
+        1. Run ``n_simulations`` independent ILP solves in parallel; each
+           uses ``simulate_projections`` (no diversity / overlap penalties).
+        2. Drop ``None`` (infeasible or failed) results.
+        3. Deduplicate by ``frozenset`` of player ``dk_id`` values.
+        4. Recompute ``projected_pts`` / ``leverage_score`` on **original**
+           projections, then assign ``portfolio_score`` via
+           ``calculate_portfolio_score``.
+        5. Sort by ``portfolio_score`` descending.
+        6. Greedy exposure pass: add lineups only if no player would exceed
+           ``max_exposure`` times ``n_lineups`` appearances (per-player cap).
+        7. If fewer than ``n_lineups`` remain, fill with sequential ILP
+           (seeded with already-selected lineups).
+        8. Re-validate each final lineup; return up to ``n_lineups`` rows.
+
+        On total failure (no valid MC lineups) or unexpected errors, falls
+        back to :meth:`_generate_lineups_sequential`.
+
+        Args:
+            projections: Player projections with q15 / q50 / q85.
+            n_lineups: Number of final lineups to return.
+            n_simulations: Number of Monte Carlo ILP draws.
+            locked_ids: Players forced into every lineup.
+            banned_ids: Players excluded from all lineups.
+            n_jobs: Parallel workers (``joblib``; solver uses ``msg=0``,
+                ``threads=1`` per worker).
+
+        Returns:
+            Up to ``n_lineups`` ``LineupResult`` instances.
+        """
+        if not projections:
+            logger.warning("run_monte_carlo: empty projections list")
+            return []
+
+        if n_lineups <= 0:
+            return []
+
+        _locked = locked_ids or set()
+        _banned = banned_ids or set()
+
+        try:
+            from joblib import Parallel, delayed
+
+            logger.info(
+                f"Monte Carlo: {n_simulations} simulations, "
+                f"target={n_lineups} lineups, n_jobs={n_jobs}"
+            )
+
+            raw_results: list[LineupResult | None] = Parallel(
+                n_jobs=n_jobs,
+                verbose=0,
+            )(
+                delayed(_monte_carlo_single_simulation)(
+                    self,
+                    projections,
+                    seed,
+                    _locked,
+                    _banned,
+                )
+                for seed in range(n_simulations)
+            )
+
+            valid_results = [r for r in raw_results if r is not None]
+            logger.info(
+                f"Monte Carlo: {len(valid_results)}/{n_simulations} "
+                f"simulations produced valid lineups"
+            )
+
+            if not valid_results:
+                logger.warning(
+                    "Monte Carlo: no valid lineups — falling back to sequential"
+                )
+                return self._generate_lineups_sequential(
+                    projections=projections,
+                    n_lineups=n_lineups,
+                    locked_ids=locked_ids,
+                    banned_ids=banned_ids,
+                    seed_previous=None,
+                )
+
+            seen: set[frozenset[str]] = set()
+            unique_results: list[LineupResult] = []
+            for result in valid_results:
+                key = frozenset(result.player_dk_ids)
+                if key not in seen:
+                    seen.add(key)
+                    unique_results.append(result)
+
+            logger.info(
+                f"Monte Carlo: {len(unique_results)} unique lineups "
+                f"from {len(valid_results)} valid"
+            )
+
+            proj_by_id = {p.player.dk_id: p for p in projections}
+            for result in unique_results:
+                lineup_projs = [
+                    proj_by_id[p.dk_id]
+                    for p, _ in result.players
+                    if p.dk_id in proj_by_id
+                ]
+                if lineup_projs:
+                    result.projected_pts = float(
+                        sum(p.pts_q50 for p in lineup_projs)
+                    )
+                    result.leverage_score = float(
+                        np.mean([p.leverage_score for p in lineup_projs])
+                    )
+                result.portfolio_score = self.calculate_portfolio_score(
+                    result, projections
+                )
+
+            unique_results.sort(
+                key=lambda r: r.portfolio_score,
+                reverse=True,
+            )
+
+            max_appearances: dict[str, int] = {}
+            selected: list[LineupResult] = []
+
+            for result in unique_results:
+                if len(selected) >= n_lineups:
+                    break
+
+                would_violate = False
+                for player, _ in result.players:
+                    current = max_appearances.get(player.dk_id, 0)
+                    proj = proj_by_id.get(player.dk_id)
+                    max_exp = proj.max_exposure if proj else 0.70
+                    if (current + 1) / max(float(n_lineups), 1.0) > max_exp:
+                        would_violate = True
+                        break
+
+                if not would_violate:
+                    selected.append(result)
+                    for player, _ in result.players:
+                        max_appearances[player.dk_id] = (
+                            max_appearances.get(player.dk_id, 0) + 1
+                        )
+
+            logger.info(
+                f"Monte Carlo: {len(selected)} lineups after "
+                f"exposure filtering (target={n_lineups})"
+            )
+
+            if len(selected) < n_lineups:
+                remaining = n_lineups - len(selected)
+                logger.info(
+                    f"Monte Carlo: filling {remaining} lineups "
+                    f"with sequential optimizer"
+                )
+                filler = self._generate_lineups_sequential(
+                    projections=projections,
+                    n_lineups=remaining,
+                    locked_ids=locked_ids,
+                    banned_ids=banned_ids,
+                    seed_previous=list(selected),
+                )
+                selected.extend(filler)
+
+            for result in selected[:n_lineups]:
+                validated = self._validator.validate(result.players)
+                result.is_valid = validated.is_valid
+
+            valid_count = sum(1 for r in selected[:n_lineups] if r.is_valid)
+            logger.info(
+                f"Monte Carlo complete: {valid_count} valid of "
+                f"{min(len(selected), n_lineups)} final lineups"
+            )
+
+            return selected[:n_lineups]
+
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                f"Monte Carlo failed ({exc}); falling back to sequential ILP"
+            )
+            return self._generate_lineups_sequential(
+                projections=projections,
+                n_lineups=n_lineups,
+                locked_ids=locked_ids,
+                banned_ids=banned_ids,
+                seed_previous=None,
+            )
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -630,4 +969,4 @@ class LineupOptimizer:
             logger.warning(
                 f"HiGHS unavailable ({exc}); falling back to CBC"
             )
-            return pulp.PULP_CBC_CMD(msg=0, timeLimit=time_limit)
+            return pulp.PULP_CBC_CMD(msg=0, timeLimit=time_limit, threads=1)
