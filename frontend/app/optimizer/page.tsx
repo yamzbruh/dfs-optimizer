@@ -1,52 +1,76 @@
 "use client";
 
 import { useState } from "react";
-import { useSlate, MOCK_LINEUPS } from "@/app/context/SlateContext";
+import { useSlate } from "@/app/context/SlateContext";
 import LockBanPanel from "@/components/LockBanPanel";
 
 export default function OptimizerPage() {
   const {
-    players,
+    playerPool,
     lockedIds,
     bannedIds,
-    addLock,
-    removeLock,
-    addBan,
-    removeBan,
-    setLineups,
-    isGenerating,
-    setIsGenerating,
+    lockPlayer,
+    unlockPlayer,
+    banPlayer,
+    unbanPlayer,
+    generateLineups,
+    loading,
+    error,
   } = useSlate();
 
   const [maxExposure, setMaxExposure] = useState(70);
   const [nLineups, setNLineups] = useState(20);
   const [generated, setGenerated] = useState(false);
 
-  // Top leverage plays
-  const leveragePlays = [...players]
+  const lockedArr = Array.from(lockedIds);
+  const bannedArr = Array.from(bannedIds);
+
+  const leveragePlays = [...playerPool]
     .filter((p) => !p.is_pitcher)
     .sort((a, b) => b.leverage - a.leverage)
     .slice(0, 10);
 
-  // Popoff candidates: high q85 relative to q50
-  const popoffs = [...players]
-    .sort((a, b) => (b.proj_pts_q85 - b.proj_pts) - (a.proj_pts_q85 - a.proj_pts))
-    .slice(0, 8);
+  const popoffs = [...playerPool].sort(
+    (a, b) =>
+      b.proj_pts_q85 - b.proj_pts - (a.proj_pts_q85 - a.proj_pts)
+  ).slice(0, 8);
 
-  function handleGenerate() {
-    setIsGenerating(true);
-    // Simulate generation delay
-    setTimeout(() => {
-      setLineups(MOCK_LINEUPS);
-      setIsGenerating(false);
-      setGenerated(true);
-    }, 1800);
+  async function handleGenerate() {
+    setGenerated(false);
+    const ok = await generateLineups(nLineups, maxExposure);
+    if (ok) setGenerated(true);
   }
 
   return (
-    <div className="max-w-screen-2xl mx-auto px-6 py-6">
-      <div className="flex gap-6">
+    <div className="max-w-screen-2xl mx-auto px-6 py-6 relative">
+      {loading && (
+        <div
+          className="absolute inset-0 z-30 flex items-center justify-center rounded-lg"
+          style={{ backgroundColor: "rgba(10,14,26,0.65)" }}
+        >
+          <div className="flex flex-col items-center gap-3">
+            <span className="inline-block w-10 h-10 border-2 border-slate-600 border-t-[#00ff88] rounded-full animate-spin" />
+            <span className="text-xs uppercase tracking-widest text-slate-400">
+              Optimizer running…
+            </span>
+          </div>
+        </div>
+      )}
 
+      {error && (
+        <div
+          className="mb-4 px-4 py-3 rounded text-sm font-medium"
+          style={{
+            backgroundColor: "rgba(239,68,68,0.08)",
+            border: "1px solid #ef444440",
+            color: "#ef4444",
+          }}
+        >
+          {error}
+        </div>
+      )}
+
+      <div className="flex gap-6">
         {/* Left panel: Controls */}
         <div
           className="w-80 shrink-0 flex flex-col gap-6 rounded-lg p-5"
@@ -60,13 +84,13 @@ export default function OptimizerPage() {
           </h2>
 
           <LockBanPanel
-            players={players}
-            lockedIds={lockedIds}
-            bannedIds={bannedIds}
-            onLock={addLock}
-            onUnlock={removeLock}
-            onBan={addBan}
-            onUnban={removeBan}
+            players={playerPool}
+            lockedIds={lockedArr}
+            bannedIds={bannedArr}
+            onLock={lockPlayer}
+            onUnlock={unlockPlayer}
+            onBan={banPlayer}
+            onUnban={unbanPlayer}
           />
 
           <div style={{ borderTop: "1px solid #1e2d4a" }} />
@@ -119,7 +143,7 @@ export default function OptimizerPage() {
               />
             </div>
 
-            {lockedIds.length > 0 && (
+            {lockedArr.length > 0 && (
               <div
                 className="text-xs px-3 py-2 rounded"
                 style={{
@@ -128,10 +152,11 @@ export default function OptimizerPage() {
                   color: "#00ff88",
                 }}
               >
-                {lockedIds.length} player{lockedIds.length !== 1 ? "s" : ""} locked · will appear in all {nLineups} lineups
+                {lockedArr.length} player{lockedArr.length !== 1 ? "s" : ""}{" "}
+                locked · will appear in all {nLineups} lineups
               </div>
             )}
-            {bannedIds.length > 0 && (
+            {bannedArr.length > 0 && (
               <div
                 className="text-xs px-3 py-2 rounded"
                 style={{
@@ -140,24 +165,33 @@ export default function OptimizerPage() {
                   color: "#ef4444",
                 }}
               >
-                {bannedIds.length} player{bannedIds.length !== 1 ? "s" : ""} banned
+                {bannedArr.length} player{bannedArr.length !== 1 ? "s" : ""}{" "}
+                banned
               </div>
             )}
           </div>
 
           {/* Generate button */}
           <button
-            onClick={handleGenerate}
-            disabled={isGenerating}
+            onClick={() => void handleGenerate()}
+            disabled={loading || playerPool.length === 0}
             className="w-full py-3 rounded-lg font-semibold text-sm tracking-wide transition-all duration-150 flex items-center justify-center gap-2"
             style={{
-              backgroundColor: isGenerating ? "#1e2d4a" : "#00ff88",
-              color: isGenerating ? "#475569" : "#0a0e1a",
-              cursor: isGenerating ? "not-allowed" : "pointer",
-              boxShadow: isGenerating ? "none" : "0 0 20px rgba(0,255,136,0.3)",
+              backgroundColor:
+                loading || playerPool.length === 0 ? "#1e2d4a" : "#00ff88",
+              color:
+                loading || playerPool.length === 0 ? "#475569" : "#0a0e1a",
+              cursor:
+                loading || playerPool.length === 0
+                  ? "not-allowed"
+                  : "pointer",
+              boxShadow:
+                loading || playerPool.length === 0
+                  ? "none"
+                  : "0 0 20px rgba(0,255,136,0.3)",
             }}
           >
-            {isGenerating ? (
+            {loading ? (
               <>
                 <span className="inline-block w-4 h-4 border-2 border-slate-500 border-t-slate-300 rounded-full animate-spin" />
                 Generating…
@@ -167,7 +201,7 @@ export default function OptimizerPage() {
             )}
           </button>
 
-          {generated && !isGenerating && (
+          {generated && !loading && (
             <div
               className="text-xs text-center font-data"
               style={{ color: "#00ff88" }}
@@ -179,6 +213,12 @@ export default function OptimizerPage() {
 
         {/* Right panel */}
         <div className="flex-1 flex flex-col gap-6 min-w-0">
+          {playerPool.length === 0 && (
+            <p className="text-sm text-slate-500">
+              Load a slate and projections on the SLATE tab before running the
+              optimizer.
+            </p>
+          )}
 
           {/* Top Leverage Plays */}
           <section>
@@ -282,19 +322,28 @@ export default function OptimizerPage() {
             >
               <table className="w-full text-sm" style={{ borderCollapse: "collapse" }}>
                 <thead
-                  style={{ backgroundColor: "#080c18", borderBottom: "1px solid #1e2d4a" }}
+                  style={{
+                    backgroundColor: "#080c18",
+                    borderBottom: "1px solid #1e2d4a",
+                  }}
                 >
                   <tr>
-                    {["Name", "Team", "Salary", "Median (q50)", "Ceiling (q85)", "Interval", "Own%"].map(
-                      (h) => (
-                        <th
-                          key={h}
-                          className="px-4 py-2 text-xs font-semibold uppercase tracking-widest text-slate-500 text-left"
-                        >
-                          {h}
-                        </th>
-                      )
-                    )}
+                    {[
+                      "Name",
+                      "Team",
+                      "Salary",
+                      "Median (q50)",
+                      "Ceiling (q85)",
+                      "Interval",
+                      "Own%",
+                    ].map((h) => (
+                      <th
+                        key={h}
+                        className="px-4 py-2 text-xs font-semibold uppercase tracking-widest text-slate-500 text-left"
+                      >
+                        {h}
+                      </th>
+                    ))}
                   </tr>
                 </thead>
                 <tbody>

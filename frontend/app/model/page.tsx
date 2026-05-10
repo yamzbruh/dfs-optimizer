@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect } from "react";
 import {
   BarChart,
   Bar,
@@ -15,98 +16,103 @@ import StatBadge from "@/components/StatBadge";
 import LeverageScatter from "@/components/LeverageScatter";
 
 export default function ModelPage() {
-  const { modelMetrics, players } = useSlate();
-  const m = modelMetrics;
+  const { modelInfo, playerPool, fetchModelInfo, loading, error } = useSlate();
 
-  const metrics = [
-    {
-      value: m.q50_rmse.toFixed(2),
-      label: "q50 RMSE",
-      color: "green" as const,
-      desc: "Root mean squared error on holdout",
-    },
-    {
-      value: m.q50_mae.toFixed(2),
-      label: "q50 MAE",
-      color: "green" as const,
-      desc: "Mean absolute error on holdout",
-    },
-    {
-      value: (m.q85_coverage * 100).toFixed(1) + "%",
-      label: "q85 Coverage",
-      color: m.q85_coverage >= 0.8 ? "green" as const : "amber" as const,
-      desc: "% actuals below q85 prediction (target 85%)",
-    },
-    {
-      value: (m.q15_coverage * 100).toFixed(1) + "%",
-      label: "q15 Coverage",
-      color: "amber" as const,
-      desc: "% actuals below q15 — MLB scoring is zero-heavy",
-    },
-    {
-      value: m.interval_width.toFixed(1),
-      label: "Interval Width",
-      color: "amber" as const,
-      desc: "Mean q85−q15 width (higher = more volatility)",
-    },
-    {
-      value: m.train_rows.toLocaleString(),
-      label: "Train Rows",
-      color: "gray" as const,
-      desc: "Pitch-by-pitch Statcast plate appearances",
-    },
-  ];
+  useEffect(() => {
+    void fetchModelInfo();
+  }, [fetchModelInfo]);
+
+  const hitterLoaded = modelInfo?.hitter_metrics?.loaded === true;
+  const pitcherLoaded = modelInfo?.pitcher_metrics?.loaded === true;
+  const hitterFc = modelInfo?.hitter_metrics?.feature_count ?? 0;
+  const pitcherFc = modelInfo?.pitcher_metrics?.feature_count ?? 0;
+
+  const hitterBarData =
+    modelInfo?.hitter_features.slice(0, 12).map((feature) => ({
+      feature,
+      /** API does not expose SHAP; bars are uniform to show column order only. */
+      presence: 1,
+    })) ?? [];
+
+  const hasHitterFeatures = hitterBarData.length > 0;
 
   return (
-    <div className="max-w-screen-2xl mx-auto px-6 py-6 flex flex-col gap-8">
+    <div className="max-w-screen-2xl mx-auto px-6 py-6 flex flex-col gap-8 relative">
+      {loading && (
+        <div
+          className="absolute inset-0 z-30 flex items-center justify-center rounded-lg"
+          style={{ backgroundColor: "rgba(10,14,26,0.65)" }}
+        >
+          <div className="flex flex-col items-center gap-3">
+            <span className="inline-block w-10 h-10 border-2 border-slate-600 border-t-[#00ff88] rounded-full animate-spin" />
+            <span className="text-xs uppercase tracking-widest text-slate-400">
+              Loading model info…
+            </span>
+          </div>
+        </div>
+      )}
 
-      {/* Metrics row */}
+      {error && (
+        <div
+          className="px-4 py-3 rounded text-sm font-medium"
+          style={{
+            backgroundColor: "rgba(239,68,68,0.08)",
+            border: "1px solid #ef444440",
+            color: "#ef4444",
+          }}
+        >
+          {error}
+        </div>
+      )}
+
+      {/* Model load status */}
       <section>
         <h2
           className="text-xs font-semibold uppercase tracking-widest mb-4"
           style={{ color: "#00ff88" }}
         >
-          01 — XGBoost Quantile Model Metrics
+          01 — Loaded models
         </h2>
         <p className="text-xs text-slate-500 mb-5">
-          Three quantile regression models (q15 / q50 / q85) trained on{" "}
-          {m.train_rows.toLocaleString()} Statcast PAs ·{" "}
-          {m.feature_count} features · holdout: May 2025
+          Status from <span className="font-data text-slate-400">GET /api/model-info</span>{" "}
+          · quantile bundles load on API startup when joblib artifacts exist.
         </p>
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4">
-          {metrics.map(({ value, label, color, desc }) => (
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+          {[
+            {
+              value: hitterLoaded ? "LOADED" : "NOT LOADED",
+              label: "Hitter q bundle",
+              color: hitterLoaded ? ("green" as const) : ("amber" as const),
+            },
+            {
+              value: pitcherLoaded ? "LOADED" : "NOT LOADED",
+              label: "Pitcher q bundle",
+              color: pitcherLoaded ? ("green" as const) : ("amber" as const),
+            },
+            {
+              value: String(hitterFc),
+              label: "Hitter feature cols",
+              color: "gray" as const,
+            },
+            {
+              value: String(pitcherFc),
+              label: "Pitcher feature cols",
+              color: "gray" as const,
+            },
+          ].map(({ value, label, color }) => (
             <div
               key={label}
               className="rounded-lg px-4 py-4 flex flex-col gap-2"
               style={{ backgroundColor: "#0f1629", border: "1px solid #1e2d4a" }}
             >
               <StatBadge value={value} label={label} color={color} size="md" />
-              <p className="text-xs text-slate-600 leading-snug">{desc}</p>
             </div>
           ))}
         </div>
-
-        {/* Coverage note */}
-        {m.q15_coverage > 0.25 && (
-          <div
-            className="mt-3 px-4 py-3 rounded text-xs"
-            style={{
-              backgroundColor: "rgba(245,158,11,0.06)",
-              border: "1px solid #f59e0b30",
-              color: "#f59e0b",
-            }}
-          >
-            ℹ q15 coverage {(m.q15_coverage * 100).toFixed(1)}% {">"} 25% — expected behavior.
-            MLB DK scoring is zero-heavy (many 0-point games), so the floor reads high. The q85
-            ceiling metric is more meaningful for GPP targeting.
-          </div>
-        )}
       </section>
 
-      {/* Scatter + Feature Importance */}
+      {/* Scatter + Feature column chart (order-only when SHAP not provided) */}
       <div className="flex gap-6">
-
-        {/* Leverage Scatter */}
         <div className="flex-1 min-w-0">
           <div
             className="rounded-lg p-5 h-full"
@@ -124,11 +130,19 @@ export default function ModelPage() {
               <span className="text-slate-600">●</span> Low
               &nbsp;·&nbsp; Top-left quadrant = GPP gold
             </p>
-            <LeverageScatter players={players} />
+            {playerPool.length > 0 ? (
+              <LeverageScatter players={playerPool} />
+            ) : (
+              <div
+                className="flex items-center justify-center text-sm text-slate-600"
+                style={{ height: 320 }}
+              >
+                Load a slate and projections to plot the current pool.
+              </div>
+            )}
           </div>
         </div>
 
-        {/* Feature Importance */}
         <div className="w-96 shrink-0">
           <div
             className="rounded-lg p-5"
@@ -138,63 +152,88 @@ export default function ModelPage() {
               className="text-xs font-semibold uppercase tracking-widest mb-1"
               style={{ color: "#00ff88" }}
             >
-              03 — SHAP Feature Importance
+              03 — Hitter feature columns
             </h2>
             <p className="text-xs text-slate-500 mb-5">
-              Top 10 features · q50 model · mean |SHAP|
+              First 12 hitter model input columns (order as returned by the API).
+              Magnitudes are not available from{" "}
+              <span className="font-data text-slate-400">/api/model-info</span>.
             </p>
-            <div style={{ height: 300 }}>
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart
-                  layout="vertical"
-                  data={m.feature_importance}
-                  margin={{ top: 0, right: 24, left: 130, bottom: 0 }}
-                >
-                  <CartesianGrid horizontal={false} stroke="#1e2d4a" strokeDasharray="2 4" />
-                  <XAxis
-                    type="number"
-                    tick={{ fill: "#475569", fontSize: 10, fontFamily: "JetBrains Mono" }}
-                    tickFormatter={(v) => v.toFixed(2)}
-                    axisLine={{ stroke: "#1e2d4a" }}
-                    tickLine={false}
-                  />
-                  <YAxis
-                    type="category"
-                    dataKey="feature"
-                    tick={{ fill: "#94a3b8", fontSize: 10, fontFamily: "JetBrains Mono" }}
-                    axisLine={false}
-                    tickLine={false}
-                    width={126}
-                  />
-                  <Tooltip
-                    formatter={(v) => [typeof v === 'number' ? v.toFixed(3) : v, "SHAP"]}
-                    contentStyle={{
-                      backgroundColor: "#0f1629",
-                      border: "1px solid #1e2d4a",
-                      borderRadius: 4,
-                      fontSize: 11,
-                      fontFamily: "JetBrains Mono",
-                      color: "#f8fafc",
-                    }}
-                    cursor={{ fill: "#ffffff06" }}
-                  />
-                  <Bar dataKey="importance" radius={[0, 2, 2, 0]} maxBarSize={16}>
-                    {m.feature_importance.map((_, i) => (
-                      <Cell
-                        key={i}
-                        fill="#00ff88"
-                        fillOpacity={1 - i * 0.07}
-                      />
-                    ))}
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
+            {hasHitterFeatures ? (
+              <div style={{ height: 300 }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart
+                    layout="vertical"
+                    data={hitterBarData.slice(0, 12)}
+                    margin={{ top: 0, right: 24, left: 130, bottom: 0 }}
+                  >
+                    <CartesianGrid
+                      horizontal={false}
+                      stroke="#1e2d4a"
+                      strokeDasharray="2 4"
+                    />
+                    <XAxis
+                      type="number"
+                      domain={[0, 1.5]}
+                      tick={{
+                        fill: "#475569",
+                        fontSize: 10,
+                        fontFamily: "JetBrains Mono",
+                      }}
+                      tickFormatter={() => ""}
+                      axisLine={{ stroke: "#1e2d4a" }}
+                      tickLine={false}
+                    />
+                    <YAxis
+                      type="category"
+                      dataKey="feature"
+                      tick={{
+                        fill: "#94a3b8",
+                        fontSize: 10,
+                        fontFamily: "JetBrains Mono",
+                      }}
+                      axisLine={false}
+                      tickLine={false}
+                      width={126}
+                    />
+                    <Tooltip
+                      formatter={(_, _n, item) => {
+                        const feat = (item as { payload?: { feature: string } })
+                          ?.payload?.feature;
+                        return [feat ?? "", "column"];
+                      }}
+                      contentStyle={{
+                        backgroundColor: "#0f1629",
+                        border: "1px solid #1e2d4a",
+                        borderRadius: 4,
+                        fontSize: 11,
+                        fontFamily: "JetBrains Mono",
+                        color: "#f8fafc",
+                      }}
+                      cursor={{ fill: "#ffffff06" }}
+                    />
+                    <Bar dataKey="presence" radius={[0, 2, 2, 0]} maxBarSize={16}>
+                      {hitterBarData.slice(0, 12).map((_, i) => (
+                        <Cell key={i} fill="#00ff88" fillOpacity={0.85} />
+                      ))}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            ) : (
+              <div
+                className="flex items-center justify-center text-xs text-slate-600 text-center px-2"
+                style={{ height: 300 }}
+              >
+                No hitter feature list returned yet — train/load a hitter model on
+                the API host.
+              </div>
+            )}
           </div>
         </div>
       </div>
 
-      {/* Model architecture note */}
+      {/* Feature lists */}
       <section>
         <div
           className="rounded-lg p-5"
@@ -204,34 +243,37 @@ export default function ModelPage() {
             className="text-xs font-semibold uppercase tracking-widest mb-4"
             style={{ color: "#00ff88" }}
           >
-            04 — Architecture Notes
+            04 — Full feature column lists
           </h2>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6 text-xs text-slate-400">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6 text-xs">
             <div>
-              <div className="font-semibold text-slate-200 mb-2">Training Data</div>
-              <ul className="space-y-1 text-slate-500">
-                <li>• Statcast pitch-by-pitch, 2023–2026</li>
-                <li>• {m.train_rows.toLocaleString()} plate appearances</li>
-                <li>• Terminal events only (events ≠ null)</li>
-                <li>• Holdout: May {new Date().getFullYear() - 1} ({m.test_rows.toLocaleString()} rows)</li>
+              <div className="font-semibold text-slate-200 mb-2">Hitter</div>
+              <ul
+                className="space-y-1 text-slate-500 font-data max-h-48 overflow-y-auto"
+                style={{ border: "1px solid #1e2d4a", borderRadius: 6, padding: 8 }}
+              >
+                {(modelInfo?.hitter_features ?? []).length ? (
+                  modelInfo!.hitter_features.map((f) => (
+                    <li key={f}>{f}</li>
+                  ))
+                ) : (
+                  <li className="text-slate-600">—</li>
+                )}
               </ul>
             </div>
             <div>
-              <div className="font-semibold text-slate-200 mb-2">Model Config</div>
-              <ul className="space-y-1 text-slate-500 font-data">
-                <li>objective: reg:quantileerror</li>
-                <li>n_estimators: 500</li>
-                <li>max_depth: 6 · lr: 0.05</li>
-                <li>subsample: 0.8 · colsample: 0.8</li>
-              </ul>
-            </div>
-            <div>
-              <div className="font-semibold text-slate-200 mb-2">Features ({m.feature_count})</div>
-              <ul className="space-y-1 text-slate-500">
-                <li>• Rolling exit velo / xwOBA (7/14/30d)</li>
-                <li>• Barrel rate, hard-hit rate windows</li>
-                <li>• Platoon advantage, batting order</li>
-                <li>• Run differential, high-leverage flag</li>
+              <div className="font-semibold text-slate-200 mb-2">Pitcher</div>
+              <ul
+                className="space-y-1 text-slate-500 font-data max-h-48 overflow-y-auto"
+                style={{ border: "1px solid #1e2d4a", borderRadius: 6, padding: 8 }}
+              >
+                {(modelInfo?.pitcher_features ?? []).length ? (
+                  modelInfo!.pitcher_features.map((f) => (
+                    <li key={f}>{f}</li>
+                  ))
+                ) : (
+                  <li className="text-slate-600">—</li>
+                )}
               </ul>
             </div>
           </div>

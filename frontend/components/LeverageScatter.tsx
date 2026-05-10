@@ -23,6 +23,17 @@ function dotColor(lev: number): string {
 }
 
 export default function LeverageScatter({ players }: Props) {
+  if (!players.length) {
+    return (
+      <div
+        className="flex items-center justify-center text-sm text-slate-600"
+        style={{ height: 320 }}
+      >
+        No players to plot.
+      </div>
+    );
+  }
+
   const data = players.map((p) => ({
     x: p.ownership,
     y: p.proj_pts,

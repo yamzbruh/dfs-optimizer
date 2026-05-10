@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 
 interface CountdownTimerProps {
-  lockTime: string; // ISO string
+  lockTime?: string | null; // ISO string when parseable from slate
   compact?: boolean;
 }
 
@@ -28,15 +28,25 @@ export default function CountdownTimer({ lockTime, compact = false }: CountdownT
   const [remaining, setRemaining] = useState<number>(0);
 
   useEffect(() => {
+    if (!lockTime) {
+      setRemaining(0);
+      return;
+    }
     const target = new Date(lockTime).getTime();
+    if (Number.isNaN(target)) {
+      setRemaining(0);
+      return;
+    }
     const tick = () => setRemaining(Math.max(0, target - Date.now()));
     tick();
     const id = setInterval(tick, 1000);
     return () => clearInterval(id);
   }, [lockTime]);
 
-  const color = getColor(remaining);
-  const label = formatCountdown(remaining);
+  const noLock =
+    !lockTime || Number.isNaN(new Date(lockTime).getTime());
+  const color = noLock ? "#64748b" : getColor(remaining);
+  const label = noLock ? "—" : formatCountdown(remaining);
 
   if (compact) {
     return (

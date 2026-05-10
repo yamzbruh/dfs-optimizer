@@ -17,6 +17,7 @@ export default function Nav() {
   const { slateInfo, lineups } = useSlate();
 
   const validCount = lineups.filter((l) => l.is_valid).length;
+  const denom = lineups.length > 0 ? lineups.length : 20;
 
   return (
     <header
@@ -66,17 +67,17 @@ export default function Nav() {
         {slateInfo && (
           <div className="flex items-center gap-4">
             <span className="font-data text-xs text-slate-500 tracking-wide">
-              {slateInfo.date}
+              {slateInfo.display_date ?? slateInfo.games[0] ?? "—"}
             </span>
             <span
               className="font-data text-xs font-semibold px-2 py-0.5 rounded"
               style={{
                 backgroundColor: "#0f1629",
                 border: "1px solid #1e2d4a",
-                color: validCount === 20 ? "#00ff88" : "#f59e0b",
+                color: validCount === denom ? "#00ff88" : "#f59e0b",
               }}
             >
-              {validCount}/20 LINEUPS
+              {validCount}/{denom} LINEUPS
             </span>
             <CountdownTimer lockTime={slateInfo.lock_time} />
           </div>
