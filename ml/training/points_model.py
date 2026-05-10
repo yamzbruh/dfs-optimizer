@@ -38,6 +38,7 @@ if str(_ROOT) not in sys.path:
 
 from data_pipeline.loaders.parquet_cache import ParquetCache  # noqa: E402
 from ml.features.feature_engineer import FeatureEngineer  # noqa: E402
+from ml.features.pitcher_feature_engineer import PitcherFeatureEngineer  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -536,3 +537,251 @@ class PointsModel:
         all_years = sorted(set(train_years))
         df = FeatureEngineer().build_full_batter_feature_matrix(years=all_years)
         return df if (df is not None and not df.empty) else None
+
+
+class PitcherPointsModel:
+    """Three XGBoost quantile regressors (q15 / q50 / q85) for pitcher DK points.
+
+    Trained on ``PitcherFeatureEngineer`` game-level rows; target is
+    ``dk_points_game``.  Models and metadata are saved with a
+    ``pitcher_`` filename prefix so they never collide with hitter
+    ``PointsModel`` artifacts.
+
+    Usage::
+
+        pm = PitcherPointsModel()
+        metrics = pm.train(years=[2023, 2024, 2025])
+        pm.save_models()
+    """
+
+    def __init__(self, model_dir: str | Path = "data/models") -> None:
+        """Initialise the pitcher model container."""
+        self.model_dir = Path(model_dir)
+        self.model_dir.mkdir(parents=True, exist_ok=True)
+        self.models: dict[str, XGBRegressor] = {}
+        self.feature_columns: list[str] = []
+        self.shap_values: dict[str, np.ndarray] = {}
+        self._cache = ParquetCache()
+        logger.debug(
+            f"PitcherPointsModel ready  model_dir={self.model_dir.resolve()}"
+        )
+
+    def train(
+        self,
+        years: list[int] | None = None,
+        holdout_year: int = 2025,
+        holdout_month: int = 5,
+        force_rebuild_features: bool = False,
+    ) -> dict:
+        """Train q15 / q50 / q85 quantile regressors on pitcher game-level data.
+
+        Loads ``features/pitcher_feature_matrix_game_level`` (or rebuilds via
+        :meth:`PitcherFeatureEngineer.build_full_pitcher_feature_matrix`).
+        Holdout defaults to **May 2025**, matching :class:`PointsModel`.
+
+        Args:
+            years: Seasons for the feature matrix.
+            holdout_year: Holdout evaluation year.
+            holdout_month: Holdout month (1–12).
+            force_rebuild_features: Rebuild pitcher matrix from Statcast / logs.
+
+        Returns:
+            Metrics dict (same structure as :meth:`PointsModel.train`).
+        """
+        _years = years if years is not None else [2023, 2024, 2025, 2026]
+        t_total = time.time()
+
+        df = self._load_pitcher_feature_matrix(_years, force_rebuild_features)
+        if df is None or df.empty:
+            raise RuntimeError(
+                "No pitcher feature matrix — run "
+                "PitcherFeatureEngineer().build_full_pitcher_feature_matrix() "
+                "first or pass force_rebuild_features=True."
+            )
+
+        if "game_date" not in df.columns:
+            raise RuntimeError("Pitcher feature matrix missing 'game_date'.")
+
+        df["game_date"] = pd.to_datetime(df["game_date"])
+        test_mask = (
+            (df["game_date"].dt.year == holdout_year)
+            & (df["game_date"].dt.month == holdout_month)
+        )
+        train_df = df.loc[~test_mask].copy()
+        test_df = df.loc[test_mask].copy()
+
+        import calendar
+        month_name = calendar.month_name[holdout_month]
+        logger.info(
+            f"[Pitcher] Train: {len(train_df):,} rows "
+            f"(all except {month_name} {holdout_year})"
+        )
+        logger.info(
+            f"[Pitcher] Test holdout: {len(test_df):,} rows "
+            f"({month_name} {holdout_year})"
+        )
+
+        if train_df.empty:
+            raise RuntimeError("No pitcher training rows for the given years.")
+        if test_df.empty:
+            logger.warning(
+                f"[Pitcher] No holdout rows for {month_name} {holdout_year}."
+            )
+
+        all_features = PitcherFeatureEngineer().get_feature_columns()
+        present = [c for c in all_features if c in df.columns]
+        missing = [c for c in all_features if c not in df.columns]
+        if missing:
+            logger.warning(
+                f"[Pitcher] Features missing from matrix (skipped): {missing}"
+            )
+        logger.info(f"[Pitcher] Training on {len(present)} features: {present}")
+
+        self.feature_columns = present
+        X_train = train_df[present].fillna(0.0)
+        y_train = train_df["dk_points_game"].fillna(0.0)
+        X_test = test_df[present].fillna(0.0) if not test_df.empty else pd.DataFrame()
+        y_test = (
+            test_df["dk_points_game"].fillna(0.0)
+            if not test_df.empty
+            else pd.Series(dtype=float)
+        )
+
+        raw_preds: dict[str, np.ndarray] = {}
+        per_q_metrics: dict[str, dict[str, float]] = {}
+
+        for quantile, name in zip(QUANTILES, QUANTILE_NAMES):
+            logger.info(f"[Pitcher] Training {name} (alpha={quantile})…")
+            t0 = time.time()
+            model = XGBRegressor(**{**XGBOOST_PARAMS, "quantile_alpha": quantile})
+            model.fit(X_train, y_train)
+            self.models[name] = model
+            logger.info(f"  [Pitcher] {name} trained in {time.time() - t0:.1f}s")
+
+            if not X_test.empty:
+                preds = model.predict(X_test)
+                raw_preds[name] = preds
+                rmse = float(np.sqrt(mean_squared_error(y_test, preds)))
+                mae = float(mean_absolute_error(y_test, preds))
+                per_q_metrics[name] = {"rmse": rmse, "mae": mae}
+                logger.info(f"  [Pitcher] {name}  RMSE={rmse:.4f}  MAE={mae:.4f}")
+
+        if not X_test.empty and all(n in raw_preds for n in QUANTILE_NAMES):
+            q15 = raw_preds["q15"]
+            q50 = raw_preds["q50"]
+            q85 = raw_preds["q85"]
+            raw_preds["q15"] = np.minimum(q15, q50)
+            raw_preds["q85"] = np.maximum(q85, q50)
+
+        coverage: dict[str, float] = {}
+        if not X_test.empty and all(n in raw_preds for n in QUANTILE_NAMES):
+            y_arr = y_test.to_numpy()
+            q15_arr = raw_preds["q15"]
+            q85_arr = raw_preds["q85"]
+            coverage = {
+                "q15_coverage": float(np.mean(y_arr < q15_arr)),
+                "q85_coverage": float(np.mean(y_arr < q85_arr)),
+                "interval_width": float(np.mean(q85_arr - q15_arr)),
+            }
+
+        logger.info(f"[Pitcher] Training complete in {time.time() - t_total:.1f}s")
+
+        return {
+            "q15_rmse": per_q_metrics.get("q15", {}).get("rmse"),
+            "q15_mae": per_q_metrics.get("q15", {}).get("mae"),
+            "q50_rmse": per_q_metrics.get("q50", {}).get("rmse"),
+            "q50_mae": per_q_metrics.get("q50", {}).get("mae"),
+            "q85_rmse": per_q_metrics.get("q85", {}).get("rmse"),
+            "q85_mae": per_q_metrics.get("q85", {}).get("mae"),
+            "q15_coverage": coverage.get("q15_coverage"),
+            "q85_coverage": coverage.get("q85_coverage"),
+            "interval_width": coverage.get("interval_width"),
+            "train_rows": len(train_df),
+            "test_rows": len(test_df),
+            "feature_count": len(present),
+            "train_years": _years,
+            "holdout_year": holdout_year,
+            "holdout_month": holdout_month,
+        }
+
+    def save_models(self, run_id: str | None = None) -> Path:
+        """Save pitcher quantile models and feature column JSON."""
+        if not self.models:
+            raise RuntimeError("No pitcher models to save — call train() first.")
+        _run_id = run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
+        for name, model in self.models.items():
+            path = self.model_dir / f"pitcher_{name}_{_run_id}.joblib"
+            joblib.dump(model, path)
+            logger.info(f"[Pitcher] Saved {name} → {path}")
+        feat_path = self.model_dir / f"pitcher_feature_columns_{_run_id}.json"
+        with feat_path.open("w") as fh:
+            json.dump(self.feature_columns, fh, indent=2)
+        logger.info(f"[Pitcher] Saved feature columns → {feat_path}")
+        return self.model_dir
+
+    def load_models(self, run_id: str) -> None:
+        """Load pitcher models and ``pitcher_feature_columns_{run_id}.json``."""
+        for name in QUANTILE_NAMES:
+            path = self.model_dir / f"pitcher_{name}_{run_id}.joblib"
+            if not path.exists():
+                raise FileNotFoundError(f"Pitcher model not found: {path}")
+            self.models[name] = joblib.load(path)
+            logger.info(f"[Pitcher] Loaded {name} ← {path}")
+        feat_path = self.model_dir / f"pitcher_feature_columns_{run_id}.json"
+        if not feat_path.exists():
+            raise FileNotFoundError(f"Pitcher feature columns not found: {feat_path}")
+        with feat_path.open() as fh:
+            self.feature_columns = json.load(fh)
+        logger.info(
+            f"[Pitcher] Loaded {len(self.feature_columns)} feature columns"
+        )
+
+    def predict(
+        self,
+        df: pd.DataFrame,
+        enforce_monotonicity: bool = True,
+    ) -> pd.DataFrame:
+        """Predict q15 / q50 / q85 pitcher DK points."""
+        if not self.models or not self.feature_columns:
+            raise ValueError("Pitcher models not loaded — train() or load_models().")
+        X = self._align_features(df)
+        out: dict[str, np.ndarray] = {}
+        for name in QUANTILE_NAMES:
+            out[name] = self.models[name].predict(X)
+        if enforce_monotonicity:
+            out["q15"] = np.minimum(out["q15"], out["q50"])
+            out["q85"] = np.maximum(out["q85"], out["q50"])
+        return pd.DataFrame(out, index=df.index)
+
+    def _align_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        aligned = pd.DataFrame(index=df.index)
+        for col in self.feature_columns:
+            if col in df.columns:
+                aligned[col] = df[col].fillna(0.0)
+            else:
+                logger.warning(
+                    f"[Pitcher] Feature {col!r} missing; filling with 0.0"
+                )
+                aligned[col] = 0.0
+        return aligned
+
+    def _load_pitcher_feature_matrix(
+        self,
+        train_years: list[int],
+        force_rebuild: bool,
+    ) -> pd.DataFrame | None:
+        key = "features/pitcher_feature_matrix_game_level"
+        if not force_rebuild:
+            df = self._cache.load(key)
+            if df is not None and not df.empty:
+                logger.info(
+                    f"[Pitcher] Loaded game-level matrix: {len(df):,} rows"
+                )
+                return df
+        logger.info("[Pitcher] Building pitcher feature matrix from Parquet…")
+        years = sorted(set(train_years))
+        df = PitcherFeatureEngineer().build_full_pitcher_feature_matrix(
+            years=years,
+            force_rebuild=force_rebuild,
+        )
+        return df if df is not None and not df.empty else None
