@@ -3,8 +3,8 @@
 Endpoints
 ---------
 * ``POST /api/upload`` — upload DK salary CSV, parse, return player pool
-* ``POST /api/projections`` — build projections for parsed players (DK avg
-  proxy until full slate feature inference is wired in V2)
+* ``POST /api/projections`` — build projections via ``SlateInference`` (XGBoost)
+  when initialized; otherwise DK avg fallback
 * ``POST /api/ownership`` — Monte Carlo ownership proxy (optional; replaces flat 10%/15%)
 * ``POST /api/optimize`` — generate lineups from current projections
 * ``GET /api/model-info`` — loaded model metadata and feature column lists
@@ -35,6 +35,7 @@ if str(_ROOT) not in sys.path:
 from data_pipeline.ingestion.dk_csv_exporter import DKLineupExporter  # noqa: E402
 from data_pipeline.ingestion.dk_csv_parser import DKCSVParser, DKPlayer  # noqa: E402
 from ml.features.ownership_projector import OwnershipProjector  # noqa: E402
+from ml.inference.slate_inference import SlateInference  # noqa: E402
 from ml.training.points_model import PitcherPointsModel, PointsModel  # noqa: E402
 from optimizer.constraints.lineup_optimizer import (  # noqa: E402
     LineupOptimizer,
@@ -69,6 +70,8 @@ _current_lineups: list[LineupResult] = []
 _upload_meta: dict = {}
 
 _ownership_projector: OwnershipProjector | None = None
+
+_slate_inference: SlateInference | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +175,7 @@ async def load_models() -> None:
     under ``data/models/``, picks the lexicographically last stem (timestamp
     runs sort correctly).  Failures are logged but do not crash the app.
     """
-    global _hitter_model, _pitcher_model, _ownership_projector
+    global _hitter_model, _pitcher_model, _ownership_projector, _slate_inference
 
     models_dir = Path("data/models")
     if models_dir.is_dir():
@@ -214,6 +217,43 @@ async def load_models() -> None:
     except Exception as exc:  # noqa: BLE001
         logger.error(f"Failed to init OwnershipProjector: {exc}")
         _ownership_projector = None
+
+    try:
+        _slate_inference = SlateInference()
+        _slate_inference.load_models()
+        _slate_inference.load_feature_matrices()
+        logger.info("SlateInference initialized")
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"Failed to init SlateInference: {exc}")
+        _slate_inference = None
+
+
+def _build_fallback_projections(players: list[DKPlayer]) -> list[PlayerProjection]:
+    """Fallback projections using DK avg when models unavailable."""
+    projections = []
+    for player in players:
+        avg = float(player.avg_points_per_game)
+        if player.is_pitcher:
+            is_starter = "SP" in player.position_eligibility
+            if not is_starter:
+                avg = min(avg, 15.0)
+            q50, q15, q85 = avg, max(0.0, avg * 0.4), avg * 2.0
+            ownership = 15.0
+        else:
+            q50, q15, q85 = avg, max(0.0, avg * 0.5), avg * 1.8
+            ownership = 10.0
+        leverage = q50 / max(ownership, 0.1)
+        projections.append(
+            PlayerProjection(
+                player=player,
+                pts_q15=round(q15, 2),
+                pts_q50=round(q50, 2),
+                pts_q85=round(q85, 2),
+                ownership_proj=round(ownership, 2),
+                leverage_score=round(leverage, 3),
+            )
+        )
+    return projections
 
 
 def _opponent_for_player(p: DKPlayer) -> str:
@@ -325,76 +365,61 @@ async def upload_csv(file: UploadFile = File(...)) -> UploadResponse:
 
 @app.post("/api/projections", response_model=list[ProjectionResponse])
 async def generate_projections() -> list[ProjectionResponse]:
-    """Build ``PlayerProjection`` rows for the current slate (DK avg proxy).
+    """Build ``PlayerProjection`` rows for the current slate.
 
-    V2 will join Statcast / feature rows and call ``PointsModel`` /
-    ``PitcherPointsModel.predict``; for now quantiles are derived from
-    ``AvgPointsPerGame`` so the dashboard and optimizer stay usable
-    without a full inference pipeline on every slate upload.
+    Uses ``SlateInference`` (cached Statcast features + XGBoost) when
+    available. Call ``POST /api/ownership`` after this to get real
+    ownership percentages from Monte Carlo simulation.
 
     Ownership defaults to flat 10% (hitters) / 15% (pitchers) until
     ``POST /api/ownership`` runs the Monte Carlo ownership proxy.
     """
-    global _current_projections
+    global _current_projections, _current_lineups
 
     if not _current_players:
         raise HTTPException(
             status_code=400,
-            detail="No players loaded. Upload a salary CSV via POST /api/upload first.",
+            detail="No players loaded. Upload a CSV first.",
         )
 
-    projections: list[PlayerProjection] = []
-    responses: list[ProjectionResponse] = []
-
-    for player in _current_players:
-        if player.is_pitcher:
-            pts_q50 = float(player.avg_points_per_game)
-            pts_q15 = max(0.0, pts_q50 * 0.4)
-            pts_q85 = pts_q50 * 2.0
-            ownership_proj = 15.0
-        else:
-            pts_q50 = float(player.avg_points_per_game)
-            pts_q15 = max(0.0, pts_q50 * 0.5)
-            pts_q85 = pts_q50 * 1.8
-            ownership_proj = 10.0
-
-        leverage = pts_q50 / max(ownership_proj, 0.1)
-
-        proj = PlayerProjection(
-            player=player,
-            pts_q15=round(pts_q15, 2),
-            pts_q50=round(pts_q50, 2),
-            pts_q85=round(pts_q85, 2),
-            ownership_proj=round(ownership_proj, 2),
-            leverage_score=round(leverage, 2),
-        )
-        projections.append(proj)
-
-        responses.append(
-            ProjectionResponse(
-                dk_id=player.dk_id,
-                name=player.name,
-                team=player.team,
-                position=_primary_slot_label(player),
-                salary=player.salary,
-                pts_q15=proj.pts_q15,
-                pts_q50=proj.pts_q50,
-                pts_q85=proj.pts_q85,
-                ownership_proj=proj.ownership_proj,
-                leverage_score=proj.leverage_score,
-                is_pitcher=player.is_pitcher,
+    try:
+        if _slate_inference is not None:
+            logger.info("Using SlateInference for real model projections")
+            projections = _slate_inference.build_projections(
+                _current_players, use_models=True
             )
+        else:
+            logger.warning("SlateInference not available — using DK avg fallback")
+            projections = _build_fallback_projections(_current_players)
+
+        _current_projections = projections
+        _current_lineups = []
+
+        logger.info(
+            f"Projections ready for {len(projections)} players "
+            f"({sum(1 for p in projections if p.player.is_pitcher)} P, "
+            f"{sum(1 for p in projections if not p.player.is_pitcher)} H)"
         )
 
-    _current_projections = projections
-
-    logger.info(
-        f"Projections ready for {len(projections)} players "
-        f"({sum(1 for p in projections if p.player.is_pitcher)} P, "
-        f"{sum(1 for p in projections if not p.player.is_pitcher)} H)"
-    )
-
-    return responses
+        return [
+            ProjectionResponse(
+                dk_id=p.player.dk_id,
+                name=p.player.name,
+                team=p.player.team,
+                position=_primary_slot_label(p.player),
+                salary=p.player.salary,
+                pts_q15=p.pts_q15,
+                pts_q50=p.pts_q50,
+                pts_q85=p.pts_q85,
+                ownership_proj=p.ownership_proj,
+                leverage_score=p.leverage_score,
+                is_pitcher=p.player.is_pitcher,
+            )
+            for p in projections
+        ]
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Projection failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/api/ownership", response_model=list[ProjectionResponse])
@@ -585,6 +610,7 @@ async def health() -> dict:
         "status": "ok",
         "hitter_model": _hitter_model is not None,
         "pitcher_model": _pitcher_model is not None,
+        "inference_ready": _slate_inference is not None,
         "players_loaded": len(_current_players),
         "projections_ready": len(_current_projections) > 0,
         "lineups_ready": len(_current_lineups) > 0,
