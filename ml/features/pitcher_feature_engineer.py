@@ -117,7 +117,8 @@ class PitcherFeatureEngineer:
 
         Returns:
             Pitcher-game DataFrame with ``k_rate_*d``, ``bb_rate_*d``,
-            ``whiff_rate_*d``, and ``velo_mean_*d`` columns.
+            ``whiff_rate_*d``, ``velo_mean_*d`` columns, and ``game_pk``
+            when present in the source Statcast data.
         """
         if df is None or df.empty:
             logger.warning("build_rolling_pitcher_features: empty input")
@@ -179,17 +180,21 @@ class PitcherFeatureEngineer:
         def _fb_velo_sum(s: pd.Series) -> float:
             return float(s.dropna().sum()) if s.notna().any() else 0.0
 
+        agg_kwargs: dict = dict(
+            terminal_events=("is_terminal", "sum"),
+            strikeouts=("is_strikeout", "sum"),
+            walks=("is_walk", "sum"),
+            swings=("is_swing", "sum"),
+            whiffs=("is_whiff", "sum"),
+            fb_velo_sum=("fb_velo", _fb_velo_sum),
+            fb_count=("is_fastball", "sum"),
+        )
+        if "game_pk" in result.columns:
+            agg_kwargs["game_pk"] = ("game_pk", "first")
+
         daily = (
             result.groupby(["pitcher", "game_date"], sort=False)
-            .agg(
-                terminal_events=("is_terminal", "sum"),
-                strikeouts=("is_strikeout", "sum"),
-                walks=("is_walk", "sum"),
-                swings=("is_swing", "sum"),
-                whiffs=("is_whiff", "sum"),
-                fb_velo_sum=("fb_velo", _fb_velo_sum),
-                fb_count=("is_fastball", "sum"),
-            )
+            .agg(**agg_kwargs)
             .reset_index()
         )
         daily["pitcher"] = pd.to_numeric(daily["pitcher"], errors="coerce")
@@ -290,9 +295,19 @@ class PitcherFeatureEngineer:
         ).astype("Int64")
 
         want = [
-            "pitcher", "game_date", "innings_pitched", "strikeouts",
-            "earned_runs", "hits_allowed", "walks_allowed", "hit_batsmen",
-            "wins", "complete_games", "shutouts", "no_hitters",
+            "pitcher",
+            "game_date",
+            "game_pk",
+            "innings_pitched",
+            "strikeouts",
+            "earned_runs",
+            "hits_allowed",
+            "walks_allowed",
+            "hit_batsmen",
+            "wins",
+            "complete_games",
+            "shutouts",
+            "no_hitters",
         ]
         cols = [c for c in want if c in game_logs.columns]
         game_logs = game_logs[cols].copy()
@@ -305,6 +320,17 @@ class PitcherFeatureEngineer:
         result["game_date"] = pd.to_datetime(result["game_date"])
 
         result = result.merge(game_logs, on=["pitcher", "game_date"], how="left")
+
+        if "game_pk_x" in result.columns:
+            if "game_pk_y" in result.columns:
+                # Prefer MLB game-log ``game_pk`` (authoritative for crosswalks).
+                result["game_pk"] = result["game_pk_y"].fillna(result["game_pk_x"])
+            else:
+                result["game_pk"] = result["game_pk_x"]
+            result = result.drop(
+                columns=["game_pk_x", "game_pk_y"],
+                errors="ignore",
+            )
 
         for col in (
             "innings_pitched", "earned_runs", "hits_allowed", "walks_allowed",

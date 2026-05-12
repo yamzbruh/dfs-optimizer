@@ -553,6 +553,18 @@ class SlateInference:
                     unmatched += 1
 
             if used_model:
+                # Sanity check: if model returns 0 for a player
+                # with a non-zero DK avg, use fallback instead
+                if q50 <= 0.0 and float(player.avg_points_per_game) > 0:
+                    logger.warning(
+                        f"{player.name}: model q50={q50:.2f} but "
+                        f"DK avg={player.avg_points_per_game:.1f} "
+                        f"— reverting to fallback"
+                    )
+                    q15, q50, q85 = self._fallback_projection(player)
+                    used_model = False
+
+            if used_model:
                 model_used += 1
             else:
                 fallback_used += 1

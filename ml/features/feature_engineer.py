@@ -6,16 +6,22 @@ method returns a *new* DataFrame — input DataFrames are never modified in plac
 
 Pipeline order for the full batter feature matrix::
 
-    load_statcast_years            (PA-level, ~651k rows)
-        → build_rolling_batter_features
-        → build_platoon_features
-        → build_batting_order_features
-        → build_game_context_features
-        → build_dk_points_labels      (PA-level: hits/walks/HBP only)
-        → aggregate_to_game_level     (sum PA dk_points → dk_points_game)
+    load_statcast_years                  (PA-level, ~651k rows)
+        → build_rolling_batter_features  (xwOBA / EV / barrel / HH rolling
+                                          + xwoba_babip_gap_7d luck signal)
+        → build_platoon_features         (platoon_advantage / same_hand)
+        → build_batting_order_features   (batting_order_multiplier)
+        → build_game_context_features    (no-op — leaky features removed)
+        → build_park_factor_features     (park_factor from PARK_FACTORS lookup)
+        → build_dk_points_labels         (PA-level: hits / walks / HBP only)
+        → aggregate_to_game_level        (sum PA dk_points → dk_points_game)
         → join_game_log_features_game_level  (R / RBI / SB → dk_points_game)
+        → build_opposing_pitcher_features    (opp starter K/ERA/whiff/velo)
         → (drop null dk_points_game)
         → save to "features/batter_feature_matrix_game_level"
+
+    Leaky in-game features removed: run_diff, is_close_game,
+    is_high_leverage, pa_count.
 
     Rebuild the cached Parquet after pipeline changes via
     ``PointsModel.train(..., force_rebuild_features=True)`` or equivalent.
@@ -66,6 +72,41 @@ _BATTING_ORDER_MULTIPLIERS: dict[int, float] = {
     7: 0.87,
     8: 0.81,
     9: 0.75,
+}
+
+# Park run-factor lookup (multi-year average, 1.0 = neutral).
+# > 1.0 = hitter-friendly, < 1.0 = pitcher-friendly.
+PARK_FACTORS: dict[str, float] = {
+    "COL": 1.146,  # Coors Field
+    "CIN": 1.072,  # Great American Ball Park
+    "BOS": 1.058,  # Fenway Park
+    "TEX": 1.044,  # Globe Life Field
+    "PHI": 1.038,  # Citizens Bank Park
+    "MIL": 1.031,  # American Family Field
+    "NYY": 1.028,  # Yankee Stadium
+    "BAL": 1.024,  # Camden Yards
+    "ATL": 1.018,  # Truist Park
+    "HOU": 1.012,  # Minute Maid Park
+    "LAA": 1.008,  # Angel Stadium
+    "MIN": 1.004,  # Target Field
+    "ARI": 1.002,  # Chase Field
+    "DET": 0.998,  # Comerica Park
+    "WSH": 0.995,  # Nationals Park
+    "TOR": 0.992,  # Rogers Centre
+    "CHC": 0.989,  # Wrigley Field
+    "CWS": 0.985,  # Guaranteed Rate Field
+    "STL": 0.982,  # Busch Stadium
+    "KCR": 0.979,  # Kauffman Stadium
+    "CLE": 0.976,  # Progressive Field
+    "NYM": 0.973,  # Citi Field
+    "TB":  0.970,  # Tropicana Field
+    "MIA": 0.967,  # loanDepot Park
+    "OAK": 0.964,  # Oakland Coliseum
+    "LAD": 0.961,  # Dodger Stadium
+    "SEA": 0.958,  # T-Mobile Park
+    "SF":  0.955,  # Oracle Park
+    "SD":  0.952,  # Petco Park
+    "PIT": 0.949,  # PNC Park
 }
 
 # Columns excluded from the training feature set.
@@ -163,6 +204,10 @@ class FeatureEngineer:
         * ``barrel_rate_{w}d`` — rolling mean of ``barrel`` (0/1)
         * ``hard_hit_{w}d`` — rolling mean of ``launch_speed >= 95``
           (derived binary column)
+        * ``xwoba_babip_gap_7d`` — ``xwoba_7d`` minus a **7-day only**
+          rolling mean of ``babip_value`` (computed internally; raw
+          ``babip_*d`` columns are not exposed — luck signal without noisy
+          multi-window BABIP features).
 
         Args:
             df: PA-level Statcast DataFrame.
@@ -216,6 +261,20 @@ class FeatureEngineer:
             result["_hard_hit"] = float("nan")
             logger.warning("build_rolling_batter_features: 'launch_speed' missing; hard_hit will be NaN")
 
+        # Normalise babip_value to 0/1 float before rolling.
+        # Statcast includes babip_value = 1 when a ball in play becomes a hit.
+        if "babip_value" in result.columns:
+            result["babip_value"] = (
+                pd.to_numeric(result["babip_value"], errors="coerce")
+                .fillna(0)
+                .clip(0, 1)
+            )
+        else:
+            logger.warning(
+                "build_rolling_batter_features: 'babip_value' not found; "
+                "xwoba_babip_gap_7d will default to 0.0"
+            )
+
         rolling_specs: list[tuple[str, str]] = [
             ("estimated_woba_using_speedangle", "xwoba"),
             ("launch_speed", "exit_velo"),
@@ -241,11 +300,23 @@ class FeatureEngineer:
                     )
                 )
 
+        # 7d BABIP rolling mean is internal only (no babip_*d output columns).
+        babip_7_internal = None
+        if "babip_value" in result.columns:
+            babip_7_internal = (
+                result.groupby("batter", sort=False)["babip_value"]
+                .transform(lambda s: s.rolling(7, min_periods=1).mean())
+            )
+        if "xwoba_7d" in result.columns and babip_7_internal is not None:
+            result["xwoba_babip_gap_7d"] = result["xwoba_7d"] - babip_7_internal
+        else:
+            result["xwoba_babip_gap_7d"] = 0.0
+
         result = result.drop(columns=["_hard_hit"], errors="ignore")
         logger.info(
             f"build_rolling_batter_features: added "
-            f"{len(rolling_specs) * len(_windows)} rolling columns "
-            f"(windows={_windows})"
+            f"{len(rolling_specs) * len(_windows)} rolling columns + "
+            f"xwoba_babip_gap_7d (windows={_windows})"
         )
         return result
 
@@ -387,60 +458,163 @@ class FeatureEngineer:
         return result
 
     def build_game_context_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add run-differential and leverage context columns.
+        """Deprecated — returns ``df`` unchanged.
 
-        Columns added:
+        ``run_diff``, ``is_close_game``, and ``is_high_leverage`` are
+        in-game state features that cannot be known before a game starts.
+        They have been removed from the feature set to eliminate data
+        leakage.  This method is retained as a no-op so call-sites do
+        not require update.
+        """
+        logger.debug(
+            "build_game_context_features: skipped "
+            "(features removed — data leakage)"
+        )
+        return df if df is not None else pd.DataFrame()
 
-        * ``run_diff`` — batting team score minus fielding team score.
-        * ``is_close_game`` — 1 when ``|run_diff| <= 2``, else 0.
-        * ``is_high_leverage`` — 1 when inning ≥ 7 *and* close game,
-          else 0.
+    def build_park_factor_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add a ballpark run-factor column based on the home team.
+
+        Looks up ``home_team`` in ``PARK_FACTORS``.  Unknown teams default
+        to ``1.0`` (neutral park).
+
+        Column added: ``park_factor``
 
         Args:
-            df: Statcast DataFrame with ``bat_score``, ``fld_score``,
-                and ``inning`` columns.
+            df: Statcast DataFrame with a ``home_team`` column.
 
         Returns:
-            New DataFrame with context columns appended.
+            New DataFrame with ``park_factor`` appended.
         """
         if df is None or df.empty:
-            logger.warning("build_game_context_features: empty input")
+            logger.warning("build_park_factor_features: empty input")
             return df if df is not None else pd.DataFrame()
 
         result = df.copy()
 
-        if "bat_score" in result.columns and "fld_score" in result.columns:
-            result["run_diff"] = result["bat_score"] - result["fld_score"]
-            result["is_close_game"] = (
-                result["run_diff"].abs() <= 2
-            ).astype(int)
-        else:
-            missing = [
-                c for c in ("bat_score", "fld_score")
-                if c not in result.columns
-            ]
+        if "home_team" not in result.columns:
             logger.warning(
-                f"build_game_context_features: missing {missing}; "
-                "run_diff and is_close_game set to 0"
+                "build_park_factor_features: 'home_team' column missing; "
+                "park_factor defaulting to 1.0"
             )
-            result["run_diff"] = 0
-            result["is_close_game"] = 0
+            result["park_factor"] = 1.0
+            return result
 
-        if "inning" in result.columns:
-            result["is_high_leverage"] = (
-                (result["inning"] >= 7) & (result["is_close_game"] == 1)
-            ).astype(int)
-        else:
-            logger.warning(
-                "build_game_context_features: 'inning' missing; "
-                "is_high_leverage set to 0"
-            )
-            result["is_high_leverage"] = 0
-
+        result["park_factor"] = result["home_team"].map(PARK_FACTORS).fillna(1.0)
+        known = result["park_factor"].ne(1.0).sum()
         logger.info(
-            "build_game_context_features: run_diff, is_close_game, "
-            "is_high_leverage added"
+            f"build_park_factor_features: park_factor added "
+            f"({known:,} rows matched a known park)"
         )
+        return result
+
+    def build_opposing_pitcher_features(
+        self,
+        df: pd.DataFrame,
+        years: list[int],
+    ) -> pd.DataFrame:
+        """Join opposing starting-pitcher rolling metrics to game-level hitter rows.
+
+        Intended to run **after** ``aggregate_to_game_level`` so the merge
+        on ``game_pk`` is one game-to-one pitcher row.  Uses the pitcher
+        with the most innings in each game as a proxy for the starter,
+        which avoids using any stats from the current game (no leakage).
+
+        Columns added:
+
+        * ``opp_k_rate_14d`` — opposing starter K-rate rolling 14d
+        * ``opp_era_approx_14d`` — opposing starter ERA proxy rolling 14d
+        * ``opp_whiff_rate_14d`` — opposing starter whiff-rate rolling 14d
+        * ``opp_velo_mean_14d`` — opposing starter velocity rolling 14d
+
+        Missing values and games with no pitcher match are filled with
+        MLB league averages (K%=22 %, ERA=4.20, whiff=24 %, velo=93.5 mph).
+
+        Args:
+            df: Game-level DataFrame containing a ``game_pk`` column.
+            years: Not used directly; retained for API symmetry with other
+                pipeline steps.
+
+        Returns:
+            New DataFrame with ``opp_*`` columns appended.
+        """
+        _DEFAULTS: dict[str, float] = {
+            "opp_k_rate_14d": 0.22,
+            "opp_era_approx_14d": 4.20,
+            "opp_whiff_rate_14d": 0.24,
+            "opp_velo_mean_14d": 93.5,
+        }
+
+        if df is None or df.empty:
+            logger.warning("build_opposing_pitcher_features: empty input")
+            return df if df is not None else pd.DataFrame()
+
+        result = df.copy()
+
+        pitcher_df = self.cache.load("features/pitcher_feature_matrix_game_level")
+        if pitcher_df is None or pitcher_df.empty:
+            logger.warning(
+                "build_opposing_pitcher_features: no pitcher feature matrix found "
+                "— using league averages"
+            )
+            for col, val in _DEFAULTS.items():
+                result[col] = val
+            return result
+
+        pitcher_cols = [
+            c for c in [
+                "pitcher", "game_date", "game_pk",
+                "k_rate_14d", "era_approx_14d",
+                "whiff_rate_14d", "velo_mean_14d",
+                "innings_pitched",
+            ]
+            if c in pitcher_df.columns
+        ]
+        pitchers = pitcher_df[pitcher_cols].copy()
+
+        # One row per game: pitcher with the most innings = proxy for starter.
+        if "innings_pitched" in pitchers.columns and "game_pk" in pitchers.columns:
+            starters = (
+                pitchers.sort_values("innings_pitched", ascending=False)
+                .groupby("game_pk")
+                .first()
+                .reset_index()
+            )
+        else:
+            starters = pitchers.copy()
+
+        rename_map = {
+            "k_rate_14d": "opp_k_rate_14d",
+            "era_approx_14d": "opp_era_approx_14d",
+            "whiff_rate_14d": "opp_whiff_rate_14d",
+            "velo_mean_14d": "opp_velo_mean_14d",
+        }
+        starters = starters.rename(columns=rename_map)
+
+        if "game_pk" in result.columns and "game_pk" in starters.columns:
+            opp_cols = ["game_pk"] + [
+                c for c in rename_map.values() if c in starters.columns
+            ]
+            result = result.merge(starters[opp_cols], on="game_pk", how="left")
+
+            matched = int(result["opp_k_rate_14d"].notna().sum())
+            total = len(result)
+            logger.info(
+                f"build_opposing_pitcher_features: "
+                f"matched {matched:,}/{total:,} rows via game_pk"
+            )
+            if total > 0 and matched / total < 0.5:
+                logger.warning(
+                    f"Low opposing pitcher match rate: "
+                    f"{matched / total:.1%} — check game_pk join"
+                )
+
+        for col, val in _DEFAULTS.items():
+            if col not in result.columns:
+                result[col] = val
+            else:
+                result[col] = result[col].fillna(val)
+
         return result
 
     # ------------------------------------------------------------------
@@ -544,13 +718,17 @@ class FeatureEngineer:
 
         * **SUM**: ``dk_points`` (renamed to ``dk_points_game``), ``_pa``
           (renamed to ``pa_count``).
-        * **LAST**: all rolling ``*_{7,14,30}d`` columns, ``platoon_advantage``,
-          ``same_hand``, ``batting_order_multiplier``, ``is_close_game``,
-          ``is_high_leverage``, ``run_diff``, ``p_throws``, ``stand``.
+        * **LAST**: rolling ``*_{7,14,30}d`` columns (excluding
+          ``xwoba_babip_gap_7d``), ``platoon_advantage``, ``same_hand``,
+          ``batting_order_multiplier``, ``park_factor``, ``xwoba_babip_gap_7d``,
+          ``p_throws``, ``stand``.
         * **FIRST**: ``home_team``, ``away_team``, ``game_pk``.
 
-        ``runs``, ``rbi``, and ``stolen_bases`` are joined **after** this step
-        via ``join_game_log_features_game_level`` so totals are not summed per PA.
+        ``runs``, ``rbi``, ``stolen_bases``, and opposing-pitcher features
+        are joined **after** this step so they are not summed per PA.
+
+        Leaky in-game features (``run_diff``, ``is_close_game``,
+        ``is_high_leverage``, ``pa_count``) are **not** included.
 
         Args:
             df: PA-level DataFrame that has already passed through the full
@@ -571,13 +749,15 @@ class FeatureEngineer:
 
         sum_cols = [c for c in ("dk_points", "_pa") if c in result.columns]
 
-        rolling_cols = [c for c in result.columns
-                        if any(c.endswith(f"_{w}d") for w in ("7", "14", "30"))]
+        rolling_cols = [
+            c for c in result.columns
+            if any(c.endswith(f"_{w}d") for w in ("7", "14", "30"))
+            and c != "xwoba_babip_gap_7d"
+        ]
 
         last_cols = [c for c in (
             "platoon_advantage", "same_hand", "batting_order_multiplier",
-            "is_close_game", "is_high_leverage", "run_diff",
-            "p_throws", "stand",
+            "park_factor", "xwoba_babip_gap_7d", "p_throws", "stand",
         ) if c in result.columns]
 
         first_cols = [c for c in ("home_team", "away_team", "game_pk")
@@ -725,16 +905,21 @@ class FeatureEngineer:
 
         Pipeline order:
 
-        1. ``load_statcast_years``             — PA-level Statcast events
-        2. ``build_rolling_batter_features``   — rolling xwOBA / EV / barrel / HH
-        3. ``build_platoon_features``          — platoon advantage / same-hand
-        4. ``build_batting_order_features``    — order-slot multiplier
-        5. ``build_game_context_features``     — run-diff / leverage flags
-        6. ``build_dk_points_labels``          — PA-level DK pts (hits / walks / HBP only)
-        7. ``aggregate_to_game_level``         — sum PA ``dk_points`` → ``dk_points_game``
-        8. ``join_game_log_features_game_level`` — R / RBI / SB → ``dk_points_game``
-        9. Drop rows where ``dk_points_game`` is null.
-        10. Save to ``features/batter_feature_matrix_game_level``.
+        1.  ``load_statcast_years``               — PA-level Statcast events
+        2.  ``build_rolling_batter_features``     — xwOBA / EV / barrel / HH rolling
+                                                    + ``xwoba_babip_gap_7d`` (internal
+                                                    7d BABIP vs xwOBA only)
+        3.  ``build_platoon_features``            — platoon advantage / same-hand
+        4.  ``build_batting_order_features``      — order-slot multiplier
+        5.  ``build_game_context_features``       — no-op (leaky features removed)
+        6.  ``build_park_factor_features``        — ballpark run factor
+        7.  ``build_dk_points_labels``            — PA-level DK pts (hits/walks/HBP)
+        8.  ``aggregate_to_game_level``           — sum PA ``dk_points`` →
+                                                    ``dk_points_game``
+        9.  ``join_game_log_features_game_level`` — R / RBI / SB → ``dk_points_game``
+        10. ``build_opposing_pitcher_features``   — opp starter K/ERA/whiff/velo
+        11. Drop rows where ``dk_points_game`` is null.
+        12. Save to ``features/batter_feature_matrix_game_level``.
 
         After changing this pipeline, rebuild the cached matrix by running
         training with ``force_rebuild_features=True`` (see
@@ -762,10 +947,12 @@ class FeatureEngineer:
         df = self.build_rolling_batter_features(df)
         df = self.build_platoon_features(df)
         df = self.build_batting_order_features(df)
-        df = self.build_game_context_features(df)
+        df = self.build_game_context_features(df)   # no-op; leaky features removed
+        df = self.build_park_factor_features(df)
         df = self.build_dk_points_labels(df)
         df = self.aggregate_to_game_level(df)
         df = self.join_game_log_features_game_level(df, _years)
+        df = self.build_opposing_pitcher_features(df, _years)
 
         before = len(df)
         df = df[df["dk_points_game"].notna()].copy()
@@ -799,9 +986,10 @@ class FeatureEngineer:
         and inference pipeline.  The target (``dk_points_game``) and
         identifier / raw columns are excluded.
 
-        All features are computed at PA level and then carried through to
-        the game-level aggregation via the ``"last"`` rule, so their values
-        represent the batter's state *entering that game*.
+        All features are pre-game knowable — no in-game state is included.
+        Rolling columns represent the batter's trailing performance *entering*
+        the game.  Opposing-pitcher columns use the starter's stats from
+        prior starts only.
 
         Returns:
             List of feature column name strings.
@@ -817,15 +1005,18 @@ class FeatureEngineer:
         return [
             # Rolling batter performance (pre-game trailing windows)
             *rolling_cols,
+            # BABIP luck signal (xwoba vs 7d BABIP only; no raw babip_*d)
+            "xwoba_babip_gap_7d",
             # Platoon matchup
             "platoon_advantage",
             "same_hand",
             # Batting order slot
             "batting_order_multiplier",
-            # Game context
-            "run_diff",
-            "is_close_game",
-            "is_high_leverage",
-            # Game volume signal
-            "pa_count",
+            # Ballpark run factor
+            "park_factor",
+            # Opposing starting pitcher quality
+            "opp_k_rate_14d",
+            "opp_era_approx_14d",
+            "opp_whiff_rate_14d",
+            "opp_velo_mean_14d",
         ]
