@@ -44,9 +44,46 @@ _DK_BATTING_WEIGHTS: dict[str, float] = {
     "hit_by_pitch": 2.0,
 }
 
+# MLB Stats API team id → DraftKings-style abbreviation.
+MLB_TEAM_ID_TO_ABBR: dict[int, str] = {
+    108: "LAA",
+    109: "ARI",
+    110: "BAL",
+    111: "BOS",
+    112: "CHC",
+    113: "CIN",
+    114: "CLE",
+    115: "COL",
+    116: "DET",
+    117: "HOU",
+    118: "KC",
+    119: "LAD",
+    120: "WSH",
+    121: "NYM",
+    133: "OAK",
+    134: "PIT",
+    135: "SD",
+    136: "SEA",
+    137: "SF",
+    138: "STL",
+    139: "TB",
+    140: "TEX",
+    141: "TOR",
+    142: "MIN",
+    143: "PHI",
+    144: "ATL",
+    145: "CWS",
+    146: "MIA",
+    147: "NYY",
+    158: "MIL",
+}
+
 
 class StatcastLoader:
     """Pulls Statcast / FanGraphs data and caches it to Parquet.
+
+    Also exposes MLB Stats API helpers (game logs, batting orders) that
+    require no API key.
 
     Usage::
 
@@ -532,6 +569,206 @@ class StatcastLoader:
             f"for {len(mlbam_ids)} players"
         )
         return combined
+
+    # ------------------------------------------------------------------
+    # Batting orders (MLB Stats API — no API key)
+    # ------------------------------------------------------------------
+
+    def get_game_lineups(self, game_date: str) -> pd.DataFrame:
+        """Pull confirmed batting orders for all games on a date.
+
+        Calls ``GET https://statsapi.mlb.com/api/v1/schedule`` with
+        ``sportId=1``, ``date=game_date``, and ``hydrate=lineups``.
+
+        Returns a DataFrame with columns:
+        ``game_pk``, ``team``, ``mlbam_id``, ``batting_order``,
+        ``player_name``, ``game_date``.
+
+        ``batting_order`` is the 1-based slot in the API lineup list (1–9
+        when nine hitters are listed).  Returns an empty DataFrame when
+        there are no games or lineups are not present.
+
+        Args:
+            game_date: Calendar date ``YYYY-MM-DD`` in MLB schedule terms.
+
+        Returns:
+            Lineup rows, or an empty DataFrame on failure / no data.
+        """
+        import requests
+
+        url = "https://statsapi.mlb.com/api/v1/schedule"
+        params = {
+            "sportId": 1,
+            "date": game_date,
+            "hydrate": "lineups",
+        }
+        try:
+            resp = requests.get(url, params=params, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"get_game_lineups failed for {game_date}: {exc}")
+            return pd.DataFrame()
+
+        rows: list[dict] = []
+
+        for date_entry in data.get("dates", []) or []:
+            for game in date_entry.get("games", []) or []:
+                game_pk = game.get("gamePk")
+                raw_lineups = game.get("lineups")
+                if not isinstance(raw_lineups, dict):
+                    continue
+                lineups = raw_lineups
+
+                home_raw = (
+                    game.get("teams", {})
+                    .get("home", {})
+                    .get("team", {})
+                    .get("id", 0)
+                )
+                home_team_id = int(home_raw) if home_raw is not None else 0
+                away_raw = (
+                    game.get("teams", {})
+                    .get("away", {})
+                    .get("team", {})
+                    .get("id", 0)
+                )
+                away_team_id = int(away_raw) if away_raw is not None else 0
+
+                for side in ("homePlayers", "awayPlayers"):
+                    players = lineups.get(side) or []
+                    if not isinstance(players, list):
+                        continue
+                    is_home = side == "homePlayers"
+                    tid = home_team_id if is_home else away_team_id
+                    team = MLB_TEAM_ID_TO_ABBR.get(tid, str(tid))
+                    for i, player in enumerate(players):
+                        if not isinstance(player, dict):
+                            continue
+                        pid = player.get("id")
+                        if pid is None:
+                            continue
+                        rows.append(
+                            {
+                                "game_pk": game_pk,
+                                "team": team,
+                                "mlbam_id": int(pid),
+                                "batting_order": i + 1,
+                                "player_name": str(
+                                    player.get("fullName", "")
+                                ).strip(),
+                                "game_date": game_date,
+                            }
+                        )
+
+        if not rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows)
+        logger.debug(
+            f"get_game_lineups {game_date}: {len(df)} player-lineup rows"
+        )
+        return df
+
+    def get_season_lineups(
+        self,
+        season: int,
+        force_refresh: bool = False,
+    ) -> pd.DataFrame:
+        """Pull batting orders for every game in a season (cached).
+
+        Iterates calendar dates from late March through early November,
+        calling :meth:`get_game_lineups` for each.  Sleeps 0.1s between
+        HTTP calls to be polite to the public API.
+
+        Cache key: ``lineups/batting_order_{season}``.
+
+        Args:
+            season: MLB season year.
+            force_refresh: When ``True``, ignore cache and re-pull.
+
+        Returns:
+            Combined DataFrame with the same columns as :meth:`get_game_lineups`,
+            or empty on failure / no data.
+        """
+        import time as time_module
+        from datetime import date, timedelta
+
+        cache_key = f"lineups/batting_order_{season}"
+
+        if not force_refresh and self.cache.exists(cache_key):
+            df = self.cache.load(cache_key)
+            if df is not None and not df.empty:
+                logger.info(
+                    f"Loaded batting orders from cache: "
+                    f"{cache_key} ({len(df):,} rows)"
+                )
+                return df
+
+        start = date(season, 3, 20)
+        today = date.today()
+        end = min(date(season, 11, 5), today)
+        if start > end:
+            logger.warning(
+                f"get_season_lineups: no date window for season={season} "
+                f"(start={start}, end={end})"
+            )
+            return pd.DataFrame()
+
+        all_dates: list[str] = []
+        current = start
+        while current <= end:
+            all_dates.append(current.strftime("%Y-%m-%d"))
+            current += timedelta(days=1)
+
+        logger.info(
+            f"Pulling batting orders for {season}: {len(all_dates)} dates"
+        )
+
+        frames: list[pd.DataFrame] = []
+        for gd in all_dates:
+            df_day = self.get_game_lineups(gd)
+            if df_day is not None and not df_day.empty:
+                frames.append(df_day)
+            time_module.sleep(0.1)
+
+        if not frames:
+            logger.warning(f"get_season_lineups: no lineup data for {season}")
+            return pd.DataFrame()
+
+        combined = pd.concat(frames, ignore_index=True)
+        combined["game_date"] = pd.to_datetime(combined["game_date"])
+
+        self.cache.save(
+            combined,
+            cache_key,
+            metadata={
+                "season": season,
+                "rows": len(combined),
+                "type": "batting_order_lineups",
+            },
+        )
+
+        logger.info(f"Batting orders {season}: {len(combined):,} rows")
+        return combined
+
+    def get_todays_lineups(self) -> pd.DataFrame:
+        """Pull today's batting-order rows (not cached).
+
+        Always hits the schedule API so callers see the freshest data.
+        """
+        today = datetime.date.today().strftime("%Y-%m-%d")
+        df = self.get_game_lineups(today)
+        if df.empty:
+            logger.warning(
+                "get_todays_lineups: no lineups posted yet "
+                f"for {today}"
+            )
+        else:
+            logger.info(
+                f"get_todays_lineups: {len(df)} players confirmed"
+            )
+        return df
 
     # ------------------------------------------------------------------
     # Derived features
