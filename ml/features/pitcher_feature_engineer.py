@@ -68,6 +68,8 @@ class PitcherFeatureEngineer:
             # Game context
             "is_home",
             "pitcher_hand",  # 0=L, 1=R
+            # Starter vs reliever proxy (from rolling IP/start)
+            "is_starter",
         ]
 
     def load_statcast_years(self, years: list[int]) -> pd.DataFrame:
@@ -358,7 +360,7 @@ class PitcherFeatureEngineer:
             df: Pitcher-game DataFrame sorted by ``pitcher``, ``game_date``.
 
         Returns:
-            New DataFrame with ``ip_per_start_*d`` columns.
+            New DataFrame with ``ip_per_start_*d`` and ``is_starter`` columns.
         """
         if df is None or df.empty:
             logger.warning("build_ip_per_start_features: empty input")
@@ -368,6 +370,7 @@ class PitcherFeatureEngineer:
         if "innings_pitched" not in result.columns:
             for w in (7, 14, 30):
                 result[f"ip_per_start_{w}d"] = 0.0
+            result["is_starter"] = 0.0
             return result
 
         result = result.sort_values(["pitcher", "game_date"]).reset_index(drop=True)
@@ -376,6 +379,7 @@ class PitcherFeatureEngineer:
             result[f"ip_per_start_{w}d"] = g.transform(
                 lambda s, ww=w: s.rolling(ww, min_periods=1).mean()
             ).fillna(0.0)
+        result["is_starter"] = (result["ip_per_start_7d"] >= 3.0).astype(float)
         return result
 
     def build_era_features(self, df: pd.DataFrame) -> pd.DataFrame:

@@ -79,6 +79,19 @@ export interface ModelInfoResponse {
   pitcher_features: string[];
 }
 
+export interface LineupStatusRow {
+  name: string;
+  team: string;
+  dk_id: string;
+  status: string;
+  reason: string;
+}
+
+export interface LineupStatusPayload {
+  report: LineupStatusRow[];
+  auto_banned_ids: string[];
+}
+
 export interface HealthResponse {
   status: string;
   hitter_model: boolean;
@@ -266,6 +279,8 @@ interface SlateContextValue {
   ownershipSimsApplied: number | null;
   /** Merged projection + roster rows for tables and charts */
   playerPool: Player[];
+  /** IL/OUT/SUSP auto-ban + DTD from last projections (server); null before first fetch */
+  lineupStatus: LineupStatusPayload | null;
   uploadCSV: (file: File) => Promise<boolean>;
   generateProjections: () => Promise<void>;
   projectOwnership: (nSims?: number) => Promise<number | undefined>;
@@ -296,6 +311,10 @@ export function SlateProvider({ children }: { children: ReactNode }) {
     null
   );
 
+  const [lineupStatus, setLineupStatus] = useState<LineupStatusPayload | null>(
+    null
+  );
+
   const rosterMap = useMemo(() => {
     const m = new Map<string, PlayerResponse>();
     for (const p of players) m.set(p.dk_id, p);
@@ -311,6 +330,20 @@ export function SlateProvider({ children }: { children: ReactNode }) {
   const playerPool = useMemo(() => {
     return projections.map((pr) => mergeToPlayer(pr, rosterMap.get(pr.dk_id)));
   }, [projections, rosterMap]);
+
+  const fetchLineupStatus = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/lineup-status`);
+      if (!res.ok) {
+        setLineupStatus(null);
+        return;
+      }
+      const j = (await res.json()) as LineupStatusPayload;
+      setLineupStatus(j);
+    } catch {
+      setLineupStatus(null);
+    }
+  }, []);
 
   const withRequest = useCallback(
     async <T,>(fn: () => Promise<T>): Promise<T | undefined> => {
@@ -360,6 +393,7 @@ export function SlateProvider({ children }: { children: ReactNode }) {
         setLockedIds(new Set());
         setBannedIds(new Set());
         setOwnershipSimsApplied(null);
+        setLineupStatus(null);
         const firstGi = data.players.find((p) => p.game_info)?.game_info ?? "";
         const lockIso = parseLockIsoFromGameInfo(firstGi);
         const dispDate = displayDateFromGameInfo(firstGi);
@@ -381,11 +415,12 @@ export function SlateProvider({ children }: { children: ReactNode }) {
         if (!projRes.ok) throw new Error(await readApiError(projRes));
         const projList = (await projRes.json()) as ProjectionResponse[];
         setProjections(projList);
+        await fetchLineupStatus();
         return true;
       });
       return ok === true;
     },
-    [withRequest]
+    [withRequest, fetchLineupStatus]
   );
 
   const generateProjections = useCallback(async () => {
@@ -397,8 +432,9 @@ export function SlateProvider({ children }: { children: ReactNode }) {
       const list = (await res.json()) as ProjectionResponse[];
       setProjections(list);
       setOwnershipSimsApplied(null);
+      await fetchLineupStatus();
     });
-  }, [withRequest]);
+  }, [withRequest, fetchLineupStatus]);
 
   const projectOwnership = useCallback(
     async (nSims: number = 10000): Promise<number | undefined> => {
@@ -531,6 +567,7 @@ export function SlateProvider({ children }: { children: ReactNode }) {
       bannedIds,
       ownershipSimsApplied,
       playerPool,
+      lineupStatus,
       uploadCSV,
       generateProjections,
       projectOwnership,
@@ -555,6 +592,7 @@ export function SlateProvider({ children }: { children: ReactNode }) {
       bannedIds,
       ownershipSimsApplied,
       playerPool,
+      lineupStatus,
       uploadCSV,
       generateProjections,
       projectOwnership,

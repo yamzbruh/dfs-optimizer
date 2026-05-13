@@ -28,6 +28,7 @@ export default function OptimizerPage() {
     loading,
     error,
     ownershipSimsApplied,
+    lineupStatus,
   } = useSlate();
 
   const [maxExposure, setMaxExposure] = useState(70);
@@ -36,9 +37,15 @@ export default function OptimizerPage() {
   const [ownershipSims, setOwnershipSims] = useState(10000);
   const [ownershipRunActive, setOwnershipRunActive] = useState(false);
   const [ownershipNotice, setOwnershipNotice] = useState<string | null>(null);
+  const [showAutoBanList, setShowAutoBanList] = useState(false);
+  const [showDtdList, setShowDtdList] = useState(false);
 
   const lockedArr = Array.from(lockedIds);
   const bannedArr = Array.from(bannedIds);
+
+  const autoBanRows =
+    lineupStatus?.report.filter((r) => r.status === "unavailable") ?? [];
+  const dtdRows = lineupStatus?.report.filter((r) => r.status === "dtd") ?? [];
 
   const leveragePlays = [...playerPool]
     .filter((p) => !p.is_pitcher)
@@ -97,6 +104,89 @@ export default function OptimizerPage() {
           }}
         >
           {error}
+        </div>
+      )}
+
+      {lineupStatus && (autoBanRows.length > 0 || dtdRows.length > 0) && (
+        <div className="mb-4 flex flex-col gap-2">
+          {autoBanRows.length > 0 && (
+            <div
+              className="rounded-lg overflow-hidden text-sm"
+              style={{
+                backgroundColor: "rgba(239,68,68,0.08)",
+                border: "1px solid #ef444440",
+              }}
+            >
+              <button
+                type="button"
+                onClick={() => setShowAutoBanList((v) => !v)}
+                className="w-full px-4 py-2.5 flex items-center justify-between text-left font-medium"
+                style={{ color: "#ef4444" }}
+              >
+                <span>
+                  {autoBanRows.length} player
+                  {autoBanRows.length !== 1 ? "s" : ""} auto-banned (IL / OUT /
+                  SUSP)
+                </span>
+                <span className="text-xs opacity-80">
+                  {showAutoBanList ? "▾" : "▸"}
+                </span>
+              </button>
+              {showAutoBanList && (
+                <ul
+                  className="px-4 pb-3 pt-0 space-y-1 text-xs text-slate-300 border-t"
+                  style={{ borderColor: "#ef444420" }}
+                >
+                  {autoBanRows.map((r) => (
+                    <li key={r.dk_id}>
+                      <span className="font-medium text-slate-200">{r.name}</span>
+                      <span className="text-slate-500"> · {r.team}</span>
+                      {r.reason ? (
+                        <span className="text-slate-500"> — {r.reason}</span>
+                      ) : null}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+          {dtdRows.length > 0 && (
+            <div
+              className="rounded-lg overflow-hidden text-sm"
+              style={{
+                backgroundColor: "rgba(234,179,8,0.08)",
+                border: "1px solid #eab30840",
+              }}
+            >
+              <button
+                type="button"
+                onClick={() => setShowDtdList((v) => !v)}
+                className="w-full px-4 py-2.5 flex items-center justify-between text-left font-medium"
+                style={{ color: "#eab308" }}
+              >
+                <span>
+                  {dtdRows.length} player{dtdRows.length !== 1 ? "s" : ""} DTD
+                  (day-to-day — not auto-banned)
+                </span>
+                <span className="text-xs opacity-80">
+                  {showDtdList ? "▾" : "▸"}
+                </span>
+              </button>
+              {showDtdList && (
+                <ul
+                  className="px-4 pb-3 pt-0 space-y-1 text-xs text-slate-300 border-t"
+                  style={{ borderColor: "#eab30830" }}
+                >
+                  {dtdRows.map((r) => (
+                    <li key={r.dk_id}>
+                      <span className="font-medium text-slate-200">{r.name}</span>
+                      <span className="text-slate-500"> · {r.team}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
         </div>
       )}
 
@@ -165,7 +255,7 @@ export default function OptimizerPage() {
               <input
                 type="range"
                 min={1}
-                max={20}
+                max={150}
                 step={1}
                 value={nLineups}
                 onChange={(e) => setNLineups(Number(e.target.value))}

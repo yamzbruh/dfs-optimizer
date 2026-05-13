@@ -10,6 +10,7 @@ Endpoints
 * ``GET /api/model-info`` — loaded model metadata and feature column lists
 * ``POST /api/export`` — export current lineups as DK upload CSV
 * ``GET /api/health`` — process health and model load flags
+* ``GET /api/lineup-status`` — IL/OUT/SUSP auto-ban report and DTD flags
 """
 
 from __future__ import annotations
@@ -34,6 +35,10 @@ if str(_ROOT) not in sys.path:
 
 from data_pipeline.ingestion.dk_csv_exporter import DKLineupExporter  # noqa: E402
 from data_pipeline.ingestion.dk_csv_parser import DKCSVParser, DKPlayer  # noqa: E402
+from data_pipeline.ingestion.lineup_status import (  # noqa: E402
+    LineupStatusChecker,
+    team_ids_from_dk_players,
+)
 from ml.features.ownership_projector import OwnershipProjector  # noqa: E402
 from ml.inference.slate_inference import SlateInference  # noqa: E402
 from ml.training.points_model import PitcherPointsModel, PointsModel  # noqa: E402
@@ -72,6 +77,10 @@ _upload_meta: dict = {}
 _ownership_projector: OwnershipProjector | None = None
 
 _slate_inference: SlateInference | None = None
+
+_status_checker: LineupStatusChecker | None = None
+_auto_banned_ids: set[str] = set()
+_lineup_status_report: list[dict[str, str]] = []
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +171,23 @@ class ModelInfoResponse(BaseModel):
     pitcher_features: list[str] = Field(default_factory=list)
 
 
+class LineupStatusRow(BaseModel):
+    """One player row for the lineup / injury status panel."""
+
+    name: str
+    team: str
+    dk_id: str
+    status: str
+    reason: str
+
+
+class LineupStatusPayload(BaseModel):
+    """Auto-banned (IL/OUT/SUSP) and DTD flags for the dashboard."""
+
+    report: list[LineupStatusRow]
+    auto_banned_ids: list[str]
+
+
 # ---------------------------------------------------------------------------
 # Startup — load latest trained quantile models (if present)
 # ---------------------------------------------------------------------------
@@ -175,7 +201,7 @@ async def load_models() -> None:
     under ``data/models/``, picks the lexicographically last stem (timestamp
     runs sort correctly).  Failures are logged but do not crash the app.
     """
-    global _hitter_model, _pitcher_model, _ownership_projector, _slate_inference
+    global _hitter_model, _pitcher_model, _ownership_projector, _slate_inference, _status_checker
 
     models_dir = Path("data/models")
     if models_dir.is_dir():
@@ -227,6 +253,13 @@ async def load_models() -> None:
         logger.error(f"Failed to init SlateInference: {exc}")
         _slate_inference = None
 
+    try:
+        _status_checker = LineupStatusChecker()
+        logger.info("LineupStatusChecker initialized")
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"Failed to init LineupStatusChecker: {exc}")
+        _status_checker = None
+
 
 def _build_fallback_projections(players: list[DKPlayer]) -> list[PlayerProjection]:
     """Fallback projections using DK avg when models unavailable."""
@@ -234,7 +267,7 @@ def _build_fallback_projections(players: list[DKPlayer]) -> list[PlayerProjectio
     for player in players:
         avg = float(player.avg_points_per_game)
         if player.is_pitcher:
-            is_starter = "SP" in player.position_eligibility
+            is_starter = (player.dk_position or "").upper() == "SP"
             if not is_starter:
                 avg = min(avg, 15.0)
             q50, q15, q85 = avg, max(0.0, avg * 0.4), avg * 2.0
@@ -277,6 +310,7 @@ def _primary_slot_label(p: DKPlayer) -> str:
 async def upload_csv(file: UploadFile = File(...)) -> UploadResponse:
     """Accept a DraftKings salary CSV, parse it, and store the player pool."""
     global _current_players, _upload_meta, _current_projections, _current_lineups
+    global _auto_banned_ids, _lineup_status_report
 
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(
@@ -312,6 +346,10 @@ async def upload_csv(file: UploadFile = File(...)) -> UploadResponse:
         _current_players = result.players
         _current_projections = []
         _current_lineups = []
+        _auto_banned_ids = set()
+        _lineup_status_report = []
+        if _status_checker is not None:
+            _status_checker.reset_cache()
 
         games = sorted(
             {
@@ -374,7 +412,7 @@ async def generate_projections() -> list[ProjectionResponse]:
     Ownership defaults to flat 10% (hitters) / 15% (pitchers) until
     ``POST /api/ownership`` runs the Monte Carlo ownership proxy.
     """
-    global _current_projections, _current_lineups
+    global _current_projections, _current_lineups, _auto_banned_ids, _lineup_status_report
 
     if not _current_players:
         raise HTTPException(
@@ -394,6 +432,26 @@ async def generate_projections() -> list[ProjectionResponse]:
 
         _current_projections = projections
         _current_lineups = []
+
+        try:
+            if _status_checker is not None and _slate_inference is not None:
+                tids = team_ids_from_dk_players(_current_players)
+                _status_checker.load_statuses(tids)
+                _auto_banned_ids = _status_checker.get_unavailable_dk_ids(
+                    _current_players,
+                    _slate_inference.match_dk_player_to_mlbam,
+                )
+                _lineup_status_report = _status_checker.get_status_report(
+                    _current_players,
+                    _slate_inference.match_dk_player_to_mlbam,
+                )
+            else:
+                _auto_banned_ids = set()
+                _lineup_status_report = []
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Lineup availability refresh failed: {exc}")
+            _auto_banned_ids = set()
+            _lineup_status_report = []
 
         logger.info(
             f"Projections ready for {len(projections)} players "
@@ -510,7 +568,8 @@ async def optimize_lineups(request: OptimizeRequest) -> list[LineupResponse]:
         )
 
     locked = set(request.locked_ids) if request.locked_ids else None
-    banned = set(request.banned_ids) if request.banned_ids else None
+    banned = (set(request.banned_ids) if request.banned_ids else set()) | _auto_banned_ids
+    banned_arg = banned if banned else None
 
     tuned = [
         replace(p, max_exposure=request.max_exposure) for p in _current_projections
@@ -520,7 +579,7 @@ async def optimize_lineups(request: OptimizeRequest) -> list[LineupResponse]:
         projections=tuned,
         n_lineups=request.n_lineups,
         locked_ids=locked,
-        banned_ids=banned,
+        banned_ids=banned_arg,
     )
 
     _current_lineups = lineups
@@ -600,6 +659,16 @@ async def model_info() -> ModelInfoResponse:
         },
         hitter_features=hitter_features,
         pitcher_features=pitcher_features,
+    )
+
+
+@app.get("/api/lineup-status", response_model=LineupStatusPayload)
+async def lineup_status() -> LineupStatusPayload:
+    """IL/OUT/SUSP auto-bans and DTD flags from the last projections refresh."""
+    rows = [LineupStatusRow(**r) for r in _lineup_status_report]
+    return LineupStatusPayload(
+        report=rows,
+        auto_banned_ids=sorted(_auto_banned_ids),
     )
 
 

@@ -24,7 +24,12 @@ from data_pipeline.ingestion.dk_csv_parser import DKPlayer
 from data_pipeline.loaders.parquet_cache import ParquetCache
 from ml.features.feature_engineer import FeatureEngineer
 from ml.features.pitcher_feature_engineer import PitcherFeatureEngineer
-from ml.training.points_model import PitcherPointsModel, PointsModel
+from ml.training.points_model import (
+    PitcherPointsModel,
+    PointsModel,
+    RelieverPointsModel,
+    StarterPointsModel,
+)
 from optimizer.constraints.lineup_optimizer import PlayerProjection
 
 
@@ -60,6 +65,8 @@ class SlateInference:
         self.cache = ParquetCache(cache_dir)
         self._hitter_model: PointsModel | None = None
         self._pitcher_model: PitcherPointsModel | None = None
+        self._starter_model: StarterPointsModel | None = None
+        self._reliever_model: RelieverPointsModel | None = None
         self._hitter_features: pd.DataFrame | None = None
         self._pitcher_features: pd.DataFrame | None = None
         self._name_to_mlbam: dict[str, int] = {}
@@ -91,6 +98,26 @@ class SlateInference:
             logger.info(f"Loaded pitcher model: {run_id}")
         else:
             logger.warning("No pitcher model found")
+
+        starter_files = sorted(models_dir.glob("starter_q50_*.joblib"))
+        if starter_files:
+            run_id = starter_files[-1].stem.replace("starter_q50_", "")
+            self._starter_model = StarterPointsModel()
+            self._starter_model.load_models(run_id)
+            logger.info(f"Loaded starter pitcher model: {run_id}")
+        else:
+            logger.warning("No starter pitcher model found (starter_q50_*.joblib)")
+
+        reliever_files = sorted(models_dir.glob("reliever_q50_*.joblib"))
+        if reliever_files:
+            run_id = reliever_files[-1].stem.replace("reliever_q50_", "")
+            self._reliever_model = RelieverPointsModel()
+            self._reliever_model.load_models(run_id)
+            logger.info(f"Loaded reliever pitcher model: {run_id}")
+        else:
+            logger.warning(
+                "No reliever pitcher model found (reliever_q50_*.joblib)"
+            )
 
     def load_feature_matrices(self) -> None:
         """Load cached feature matrices and build name lookup.
@@ -330,6 +357,10 @@ class SlateInference:
         )
         return mlbam_id
 
+    def match_dk_player_to_mlbam(self, player: DKPlayer) -> int | None:
+        """Public wrapper for DK row → MLBAM (injury / availability checks)."""
+        return self._match_player(player)
+
     def _get_latest_hitter_features(self, mlbam_id: int) -> pd.Series | None:
         """Get feature row for inference (pre-game rolling averages).
 
@@ -456,6 +487,19 @@ class SlateInference:
             else:
                 row_dict[col] = 0.0
 
+        # Override is_starter from dk_position at inference time.
+        # Historical feature rows may reflect a different role (e.g. a reliever
+        # who was a starter earlier). dk_position is the ground truth for today.
+        if "is_starter" in feature_cols:
+            row_dict["is_starter"] = (
+                1.0 if (player.dk_position or "").upper() == "SP" else 0.0
+            )
+
+        if (player.dk_position or "").upper() != "SP":
+            for ip_col in ("ip_per_start_7d", "ip_per_start_14d", "ip_per_start_30d"):
+                if ip_col in feature_cols and float(row_dict.get(ip_col, 0) or 0) > 2.0:
+                    row_dict[ip_col] = 1.0  # typical reliever outing
+
         return pd.DataFrame([row_dict])[feature_cols]
 
     def _fallback_projection(self, player: DKPlayer) -> tuple[float, float, float]:
@@ -468,8 +512,7 @@ class SlateInference:
 
         if player.is_pitcher:
             # Check if reliever — cap at 15 pts
-            dk_pos = (player.dk_position or "").upper()
-            is_starter = "SP" in player.position_eligibility or "SP" in dk_pos
+            is_starter = (player.dk_position or "").upper() == "SP"
             if not is_starter:
                 avg = min(avg, 15.0)
             q50 = avg
@@ -525,15 +568,32 @@ class SlateInference:
                     try:
                         if player.is_pitcher:
                             feat_row = self._get_latest_pitcher_features(mlbam_id)
-                            if feat_row is not None and self._pitcher_model is not None:
-                                feat_df = self._build_pitcher_feature_vector(
-                                    feat_row, player
-                                )
-                                preds = self._pitcher_model.predict(feat_df)
-                                q15 = float(max(0, preds["q15"].iloc[0]))
-                                q50 = float(max(0, preds["q50"].iloc[0]))
-                                q85 = float(max(0, preds["q85"].iloc[0]))
-                                used_model = True
+                            if feat_row is not None:
+                                preds = None
+                                is_sp = (player.dk_position or "").upper() == "SP"
+                                if is_sp and self._starter_model is not None:
+                                    feat_df = self._build_pitcher_feature_vector(
+                                        feat_row, player
+                                    )
+                                    preds = self._starter_model.predict(feat_df)
+                                elif (
+                                    not is_sp
+                                    and self._reliever_model is not None
+                                ):
+                                    feat_df = self._build_pitcher_feature_vector(
+                                        feat_row, player
+                                    )
+                                    preds = self._reliever_model.predict(feat_df)
+                                elif self._pitcher_model is not None:
+                                    feat_df = self._build_pitcher_feature_vector(
+                                        feat_row, player
+                                    )
+                                    preds = self._pitcher_model.predict(feat_df)
+                                if preds is not None:
+                                    q15 = float(max(0, preds["q15"].iloc[0]))
+                                    q50 = float(max(0, preds["q50"].iloc[0]))
+                                    q85 = float(max(0, preds["q85"].iloc[0]))
+                                    used_model = True
                         else:
                             feat_row = self._get_latest_hitter_features(mlbam_id)
                             if feat_row is not None and self._hitter_model is not None:
