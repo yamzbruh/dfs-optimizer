@@ -535,7 +535,10 @@ class PointsModel:
 
         logger.info("Building feature matrix from Statcast Parquet files…")
         all_years = sorted(set(train_years))
-        df = FeatureEngineer().build_full_batter_feature_matrix(years=all_years)
+        df = FeatureEngineer().build_full_batter_feature_matrix(
+            years=all_years,
+            force_rebuild=force_rebuild,
+        )
         return df if (df is not None and not df.empty) else None
 
 

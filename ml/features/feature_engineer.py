@@ -8,7 +8,8 @@ Pipeline order for the full batter feature matrix::
 
     load_statcast_years                  (PA-level, ~651k rows)
         → build_rolling_batter_features  (xwOBA / EV / barrel / HH / K% / BB%
-                                          rolling + xwoba_babip_gap_7d luck signal)
+                                          rolling, EV–barrel–HH 7d-vs-30d trends,
+                                          xwoba_babip_gap_7d luck signal)
         → build_platoon_features         (platoon_advantage / same_hand)
         → build_game_context_features    (no-op — leaky features removed)
         → build_park_factor_features     (park_factor from PARK_FACTORS lookup)
@@ -203,9 +204,12 @@ class FeatureEngineer:
 
         * ``xwoba_{w}d`` — rolling mean of ``estimated_woba_using_speedangle``
         * ``exit_velo_{w}d`` — rolling mean of ``launch_speed``
+        * ``exit_velo_trend`` — ``exit_velo_7d - exit_velo_30d`` (short vs baseline)
         * ``barrel_rate_{w}d`` — rolling mean of ``barrel`` (0/1)
+        * ``barrel_rate_trend`` — ``barrel_rate_7d - barrel_rate_30d``
         * ``hard_hit_{w}d`` — rolling mean of ``launch_speed >= 95``
           (derived binary column)
+        * ``hard_hit_trend`` — ``hard_hit_7d - hard_hit_30d``
         * ``k_rate_{w}d`` — rolling mean of strikeout terminal events
           (``strikeout``, ``strikeout_double_play``)
         * ``bb_rate_{w}d`` — rolling mean of ``events == walk``
@@ -322,6 +326,17 @@ class FeatureEngineer:
                     )
                 )
 
+        if "barrel_rate_7d" in result.columns and "barrel_rate_30d" in result.columns:
+            result["barrel_rate_trend"] = (
+                result["barrel_rate_7d"] - result["barrel_rate_30d"]
+            )
+        if "hard_hit_7d" in result.columns and "hard_hit_30d" in result.columns:
+            result["hard_hit_trend"] = result["hard_hit_7d"] - result["hard_hit_30d"]
+        if "exit_velo_7d" in result.columns and "exit_velo_30d" in result.columns:
+            result["exit_velo_trend"] = (
+                result["exit_velo_7d"] - result["exit_velo_30d"]
+            )
+
         # 7d BABIP rolling mean is internal only (no babip_*d output columns).
         babip_7_internal = None
         if "babip_value" in result.columns:
@@ -338,10 +353,15 @@ class FeatureEngineer:
             columns=["_hard_hit", "_k_event", "_bb_event"],
             errors="ignore",
         )
+        n_roll = len(rolling_specs) * len(_windows)
+        n_trend = sum(
+            1
+            for c in ("barrel_rate_trend", "hard_hit_trend", "exit_velo_trend")
+            if c in result.columns
+        )
         logger.info(
-            f"build_rolling_batter_features: added "
-            f"{len(rolling_specs) * len(_windows)} rolling columns + "
-            f"xwoba_babip_gap_7d (windows={_windows})"
+            f"build_rolling_batter_features: added {n_roll} rolling columns + "
+            f"{n_trend} trend columns + xwoba_babip_gap_7d (windows={_windows})"
         )
         return result
 
@@ -1057,7 +1077,8 @@ class FeatureEngineer:
         * **SUM**: ``dk_points`` (renamed to ``dk_points_game``), ``_pa``
           (renamed to ``pa_count``).
         * **LAST**: rolling ``*_{7,14,30}d`` columns (excluding
-          ``xwoba_babip_gap_7d``), ``platoon_advantage``, ``same_hand``,
+          ``xwoba_babip_gap_7d``), ``barrel_rate_trend``, ``hard_hit_trend``,
+          ``exit_velo_trend``, ``platoon_advantage``, ``same_hand``,
           ``batting_order_multiplier``, ``park_factor``, ``xwoba_babip_gap_7d``,
           ``k_rate_*``, ``bb_rate_*``, ``p_throws``, ``stand``.
         * **FIRST**: ``home_team``, ``away_team``, ``game_pk``.
@@ -1096,6 +1117,7 @@ class FeatureEngineer:
         last_cols = [c for c in (
             "platoon_advantage", "same_hand", "batting_order_multiplier",
             "park_factor", "xwoba_babip_gap_7d", "p_throws", "stand",
+            "barrel_rate_trend", "hard_hit_trend", "exit_velo_trend",
         ) if c in result.columns]
 
         first_cols = [c for c in ("home_team", "away_team", "game_pk")
@@ -1327,6 +1349,7 @@ class FeatureEngineer:
     def build_full_batter_feature_matrix(
         self,
         years: list[int] | None = None,
+        force_rebuild: bool = False,
     ) -> pd.DataFrame:
         """Run the complete feature-engineering pipeline and cache the result.
 
@@ -1334,7 +1357,9 @@ class FeatureEngineer:
 
         1.  ``load_statcast_years``               — PA-level Statcast events
         2.  ``build_rolling_batter_features``     — xwOBA / EV / barrel / HH /
-                                                    K% / BB% rolling + ``xwoba_babip_gap_7d``
+                                                    K% / BB% rolling, short-vs-30d
+                                                    trends for EV/barrel/HH, and
+                                                    ``xwoba_babip_gap_7d``
         3.  ``build_platoon_features``            — platoon advantage / same-hand
         4.  ``build_game_context_features``       — no-op (leaky features removed)
         5.  ``build_park_factor_features``        — ballpark run factor
@@ -1349,20 +1374,34 @@ class FeatureEngineer:
         12. Drop rows where ``dk_points_game`` is null.
         13. Save to ``features/batter_feature_matrix_game_level``.
 
-        After changing this pipeline, rebuild the cached matrix by running
-        training with ``force_rebuild_features=True`` (see
-        ``ml.training.points_model.PointsModel.train``) or delete the Parquet
-        and re-run this method.
+        After changing this pipeline, rebuild the cached matrix by passing
+        ``force_rebuild=True``, running training with
+        ``force_rebuild_features=True`` (see ``ml.training.points_model.PointsModel.train``),
+        or deleting the Parquet and re-running this method.
 
         Args:
             years: Season years to include.  Defaults to
                 ``[2023, 2024, 2025, 2026]``.
+            force_rebuild: When ``True``, ignore cache and rebuild from Statcast
+                Parquet pulls.
 
         Returns:
             Game-level feature matrix with target ``dk_points_game``, or an
             empty DataFrame if no source data was available.
         """
         _years = years if years is not None else [2023, 2024, 2025, 2026]
+        cache_key = "features/batter_feature_matrix_game_level"
+
+        if not force_rebuild and self.cache.exists(cache_key):
+            cached = self.cache.load(cache_key)
+            if cached is not None and not cached.empty:
+                logger.info(
+                    f"Loaded batter features from cache: {cache_key} "
+                    f"({len(cached):,} rows)"
+                )
+                return cached
+
+        logger.info("Building batter feature matrix…")
 
         df = self.load_statcast_years(_years)
         if df.empty:
@@ -1397,7 +1436,7 @@ class FeatureEngineer:
         if not df.empty:
             self.cache.save(
                 df,
-                "features/batter_feature_matrix_game_level",
+                cache_key,
                 metadata={
                     "years": _years,
                     "rows": len(df),
@@ -1425,23 +1464,28 @@ class FeatureEngineer:
         (inference only), typically overwriting or augmenting the team-offense
         signal.
 
+        Rolling columns: ``xwoba``, ``k_rate``, and ``bb_rate`` use 7 / 14 /
+        30 game windows.  ``exit_velo``, ``barrel_rate``, and ``hard_hit`` use
+        the same rolling series internally, but the model feature list keeps
+        only the 30d baseline plus a 7d-vs-30d **trend** column per metric to
+        reduce collinearity.
+
         Returns:
             List of feature column name strings.
         """
-        rolling_metrics = [
-            "xwoba",
-            "exit_velo",
-            "barrel_rate",
-            "hard_hit",
-            "k_rate",
-            "bb_rate",
-        ]
         windows = [7, 14, 30]
-        rolling_cols = [
-            f"{metric}_{w}d"
-            for metric in rolling_metrics
-            for w in windows
+
+        rolling_cols = [f"xwoba_{w}d" for w in windows]
+        rolling_cols += [
+            "exit_velo_30d",
+            "exit_velo_trend",
+            "barrel_rate_30d",
+            "barrel_rate_trend",
+            "hard_hit_30d",
+            "hard_hit_trend",
         ]
+        rolling_cols += [f"k_rate_{w}d" for w in windows]
+        rolling_cols += [f"bb_rate_{w}d" for w in windows]
 
         return [
             # Rolling batter performance (pre-game trailing windows)
