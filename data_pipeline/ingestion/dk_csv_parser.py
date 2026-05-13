@@ -5,7 +5,12 @@ Parses the raw DraftKings salary export (9 columns) into structured
 collected as validation errors rather than raising, so a single
 malformed row never blocks an entire slate ingestion.
 
-Expected DK salary CSV columns (in order):
+Supports the **classic** export (header row first, 9 columns) and the
+**new** export with 11 leading empty columns (lineup block) before the
+same 9 salary columns; the header row is detected and leading columns
+stripped.
+
+Expected DK salary CSV columns (in order, after any leading offset):
     Position, Name + ID, Name, ID, Roster Position, Salary,
     Game Info, TeamAbbrev, AvgPointsPerGame
 """
@@ -37,6 +42,10 @@ EXPECTED_COLUMNS: tuple[str, ...] = (
     "TeamAbbrev",
     "AvgPointsPerGame",
 )
+
+# New DK export: 11 leading empty columns (lineup block), then the 9 salary columns.
+_NEW_FORMAT_LEADING_EMPTY_COLS = 11
+_NEW_FORMAT_MIN_COLS = _NEW_FORMAT_LEADING_EMPTY_COLS + len(EXPECTED_COLUMNS)
 
 # Game Info format: "ATL@LAD 05/08/2026 10:10PM ET"
 # Captures: away, home, MM/DD/YYYY date, "10:10PM ET" time string.
@@ -95,6 +104,8 @@ class DKCSVParser:
         self._file_hash: str | None = None
         self._raw_row_count: int = 0
         self._parsed_row_count: int = 0
+        # 1-based CSV line number of the first player row (for validation messages).
+        self._first_player_csv_line_1based: int = 2
 
     @property
     def last_result(self) -> ParseResult:
@@ -119,6 +130,93 @@ class DKCSVParser:
                 hasher.update(chunk)
         return hasher.hexdigest()
 
+    @staticmethod
+    def _cell_str(value: Any) -> str:
+        """Normalize a header=None cell to stripped string (empty if NaN)."""
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return ""
+        return str(value).strip()
+
+    @classmethod
+    def _row_cells_upto(cls, row: pd.Series, n: int) -> list[str]:
+        """First ``n`` cells of a row as stripped strings (pad if short)."""
+        out: list[str] = []
+        for j in range(n):
+            if j < len(row):
+                out.append(cls._cell_str(row.iloc[j]))
+            else:
+                out.append("")
+        return out
+
+    @classmethod
+    def _is_new_format_header_row(cls, row: pd.Series) -> bool:
+        """True when row has 20+ fields, first 11 empty, then standard DK headers."""
+        if len(row) < _NEW_FORMAT_MIN_COLS:
+            return False
+        cells = cls._row_cells_upto(row, _NEW_FORMAT_MIN_COLS)
+        if not all(c == "" for c in cells[:_NEW_FORMAT_LEADING_EMPTY_COLS]):
+            return False
+        return tuple(cells[_NEW_FORMAT_LEADING_EMPTY_COLS :]) == EXPECTED_COLUMNS
+
+    def _load_dk_salary_dataframe(self, path: Path) -> pd.DataFrame:
+        """Load salary grid: classic 9-column header, or new 11-prefixed layout."""
+        df_std: pd.DataFrame | None = None
+        std_parser_error: pd.errors.ParserError | None = None
+        try:
+            df_std = pd.read_csv(
+                path, encoding="utf-8", dtype=str, keep_default_na=False
+            )
+            if tuple(df_std.columns) == EXPECTED_COLUMNS:
+                self._first_player_csv_line_1based = 2
+                return df_std
+        except pd.errors.ParserError as exc:
+            std_parser_error = exc
+
+        # Fall through to header=None scan for new format (or wrong classic header)
+        df_raw = pd.read_csv(
+            path,
+            header=None,
+            encoding="utf-8",
+            dtype=str,
+            keep_default_na=False,
+            names=list(range(20)),  # allocate 20 columns, extras filled with NaN
+        )
+        header_idx: int | None = None
+        scan = min(80, len(df_raw))
+        for i in range(scan):
+            if self._is_new_format_header_row(df_raw.iloc[i]):
+                header_idx = i
+                break
+
+        if header_idx is None:
+            logger.warning(
+                "DK CSV columns do not match classic format and no new-format "
+                "(11 empty + 9 DK columns) header found; parsing with default header"
+            )
+            self._first_player_csv_line_1based = 2
+            if df_std is not None:
+                return df_std
+            if std_parser_error is not None:
+                raise std_parser_error
+            raise RuntimeError(
+                "DK CSV could not be read with standard headers and no "
+                "new-format header row was found."
+            )
+
+        body = df_raw.iloc[
+            header_idx + 1 :,
+            _NEW_FORMAT_LEADING_EMPTY_COLS : _NEW_FORMAT_LEADING_EMPTY_COLS
+            + len(EXPECTED_COLUMNS),
+        ].copy()
+        body.columns = list(EXPECTED_COLUMNS)
+        self._first_player_csv_line_1based = header_idx + 2
+        logger.info(
+            "Detected new DK CSV layout (11 leading empty columns); "
+            f"header CSV line {header_idx + 1}, first player line "
+            f"{self._first_player_csv_line_1based}"
+        )
+        return body
+
     def parse(self, file_path: str | Path) -> list[DKPlayer]:
         """Parse a DK salary CSV file into a list of ``DKPlayer``.
 
@@ -133,16 +231,17 @@ class DKCSVParser:
         self._validation_errors = []
         self._raw_row_count = 0
         self._parsed_row_count = 0
+        self._first_player_csv_line_1based = 2
         self._file_hash = self.get_file_hash(path)
         logger.info(f"Parsing DK CSV {path} (sha256={self._file_hash[:12]}…)")
 
-        df = pd.read_csv(path, encoding="utf-8", dtype=str, keep_default_na=False)
+        df = self._load_dk_salary_dataframe(path)
         self._raw_row_count = len(df)
 
         self._validate_columns(df)
 
         for idx, row in df.iterrows():
-            row_num = int(idx) + 2  # +1 for 0-index, +1 for header row
+            row_num = int(idx) + self._first_player_csv_line_1based
             try:
                 player = self._parse_row(row, row_num)
             except Exception as exc:  # noqa: BLE001 - intentionally broad
