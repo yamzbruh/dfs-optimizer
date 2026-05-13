@@ -525,6 +525,88 @@ class SlateInference:
 
         return q15, q50, q85
 
+    def _get_pa_count_30d(self, mlbam_id: int) -> int:
+        """Return actual PA count from game logs in last 30 days.
+
+        Loads hitting game logs from cache and sums at_bats + walks +
+        hbp + sac_flies for the player in the last 30 days.
+        Falls back to estimating from feature matrix row count if logs unavailable.
+        """
+        try:
+            cutoff = pd.Timestamp.now() - pd.Timedelta(days=30)
+            for year in [2026, 2025]:
+                key = f"gamelogs/hitting_{year}"
+                gl = self.cache.load(key)
+                if gl is None or gl.empty:
+                    continue
+                if "batter" not in gl.columns:
+                    continue
+                gl = gl.copy()
+                gl["game_date"] = pd.to_datetime(gl["game_date"], errors="coerce")
+                batter_series = pd.to_numeric(gl["batter"], errors="coerce")
+                player_gl = gl[
+                    (batter_series == mlbam_id) & (gl["game_date"] >= cutoff)
+                ]
+                if player_gl.empty:
+                    continue
+                pa = 0.0
+                for col in ["at_bats", "walks", "hit_by_pitch", "sac_flies"]:
+                    if col in player_gl.columns:
+                        pa += float(player_gl[col].fillna(0).sum())
+                if pa == 0:
+                    pa = len(player_gl) * 3.8
+                return int(pa)
+        except Exception as exc:
+            logger.debug(f"_get_pa_count_30d failed for {mlbam_id}: {exc}")
+
+        if self._hitter_features is not None and "batter" in self._hitter_features.columns:
+            cutoff = pd.Timestamp.now() - pd.Timedelta(days=30)
+            df = self._hitter_features
+            batter_num = pd.to_numeric(df["batter"], errors="coerce")
+            sub = df[batter_num == mlbam_id]
+            if "game_date" in sub.columns and not sub.empty:
+                sub = sub.copy()
+                sub["_gd"] = pd.to_datetime(sub["game_date"], errors="coerce")
+                recent = sub[sub["_gd"] >= cutoff]
+                if not recent.empty:
+                    return int(len(recent) * 3.8)
+        return 0
+
+    def _confidence_weight_projection(
+        self,
+        q15: float,
+        q50: float,
+        q85: float,
+        pa_30d: int,
+    ) -> tuple[float, float, float]:
+        """Blend projection toward league average based on PA sample size.
+
+        Players with few PA get pulled toward league average.
+        Full-season players (115+ PA in 30d) get full model projection.
+
+        League averages derived from 180k game rows, starters non-zero:
+            q15=3.0, q50=7.0, q85=16.0
+        """
+        LEAGUE_AVG_PA_30D = 115
+        LEAGUE_Q15 = 3.0
+        LEAGUE_Q50 = 7.0
+        LEAGUE_Q85 = 16.0
+
+        confidence = min(pa_30d / LEAGUE_AVG_PA_30D, 1.0)
+
+        adj_q15 = confidence * q15 + (1 - confidence) * LEAGUE_Q15
+        adj_q50 = confidence * q50 + (1 - confidence) * LEAGUE_Q50
+        adj_q85 = confidence * q85 + (1 - confidence) * LEAGUE_Q85
+
+        if confidence < 0.5:
+            logger.debug(
+                f"Low confidence projection: pa_30d={pa_30d}, "
+                f"confidence={confidence:.2f}, "
+                f"q50 {q50:.1f} → {adj_q50:.1f}"
+            )
+
+        return adj_q15, adj_q50, adj_q85
+
     def build_projections(
         self,
         players: list[DKPlayer],
@@ -557,6 +639,7 @@ class SlateInference:
         fallback_used = 0
 
         for player in players:
+            mlbam_id: int | None = None
             q15, q50, q85 = self._fallback_projection(player)
             used_model = False
 
@@ -623,6 +706,15 @@ class SlateInference:
                     )
                     q15, q50, q85 = self._fallback_projection(player)
                     used_model = False
+
+            if mlbam_id is not None and not player.is_pitcher:
+                pa_30d = self._get_pa_count_30d(mlbam_id)
+                q15, q50, q85 = self._confidence_weight_projection(
+                    q15, q50, q85, pa_30d
+                )
+
+            # Unmatched players use DK avg fallback as-is.
+            # To improve callup coverage: refresh Chadwick cache daily in automation pipeline.
 
             if used_model:
                 model_used += 1
