@@ -29,6 +29,20 @@ ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
 ODDS_BASE_URL = "https://api.the-odds-api.com/v4"
 SPORT = "baseball_mlb"
 
+# Odds API uses different abbreviations than DraftKings in some cases
+ODDS_API_TO_DK_ABBR: dict[str, str] = {
+    "OAK": "ATH",  # Athletics moved to Sacramento, DK uses ATH
+    "ARI": "ARI",  # same
+    "CWS": "CWS",  # same
+    "WSH": "WSH",  # same
+    "KC": "KC",  # same
+    "TB": "TB",  # same
+    "SF": "SF",  # same
+    "SD": "SD",  # same
+    "LAA": "LAA",  # same
+    "LAD": "LAD",  # same
+}
+
 # Session cache: avoid repeat calls during one process lifetime.
 _ODDS_SESSION_DF: pd.DataFrame | None = None
 
@@ -329,7 +343,9 @@ class OddsIngestion:
             "Washington Nationals": "WSH",
             "Athletics": "OAK",
         }
-        return mapping.get(full_name, full_name[:3].upper())
+        team = mapping.get(full_name, full_name[:3].upper())
+        team = ODDS_API_TO_DK_ABBR.get(team, team)
+        return team
 
     def get_team_implied_totals(self) -> dict[str, float]:
         """Return mapping of team abbreviation → implied total.

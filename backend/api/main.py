@@ -248,6 +248,7 @@ async def load_models() -> None:
         _slate_inference = SlateInference()
         _slate_inference.load_models()
         _slate_inference.load_feature_matrices()
+        _slate_inference.load_vegas()
         logger.info("SlateInference initialized")
     except Exception as exc:  # noqa: BLE001
         logger.error(f"Failed to init SlateInference: {exc}")
@@ -423,6 +424,7 @@ async def generate_projections() -> list[ProjectionResponse]:
     try:
         if _slate_inference is not None:
             logger.info("Using SlateInference for real model projections")
+            _slate_inference.load_vegas()
             projections = _slate_inference.build_projections(
                 _current_players, use_models=True
             )

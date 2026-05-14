@@ -21,6 +21,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from data_pipeline.ingestion.dk_csv_parser import DKPlayer
+from data_pipeline.ingestion.odds_ingestion import OddsIngestion
 from data_pipeline.loaders.parquet_cache import ParquetCache
 from ml.features.feature_engineer import FeatureEngineer
 from ml.features.pitcher_feature_engineer import PitcherFeatureEngineer
@@ -73,6 +74,7 @@ class SlateInference:
         self._normalized_name_map: dict[str, int] = {}
         self._mlbam_to_name: dict[int, str] = {}
         self._mlbam_to_team: dict[int, str] = {}
+        self._vegas_implied: dict[str, float] = {}
         logger.debug("SlateInference ready")
 
     def load_models(self) -> None:
@@ -444,6 +446,43 @@ class SlateInference:
             else:
                 row_dict[col] = 0.0
 
+        # Override team_runs_per_game_30d with real Vegas implied total if available
+        player_team = (player.team or "").strip().upper()
+        if player_team and "team_runs_per_game_30d" in feature_cols:
+            vegas_implied = self._vegas_implied.get(player_team)
+            if vegas_implied is not None and vegas_implied > 0:
+                row_dict["team_runs_per_game_30d"] = vegas_implied
+                prev_tr = feature_row.get("team_runs_per_game_30d")
+                prev_s = (
+                    f"{float(prev_tr):.2f}"
+                    if prev_tr is not None and pd.notna(prev_tr)
+                    else "N/A"
+                )
+                logger.debug(
+                    f"{player.name} ({player_team}): "
+                    f"Vegas implied={vegas_implied:.2f} (was {prev_s})"
+                )
+
+            logger.debug(
+                f"Feature vector team_runs_per_game_30d for {player.name}: {row_dict.get('team_runs_per_game_30d')}"
+            )
+
+        # Override opp_runs_allowed_30d with opposing team's implied total
+        # (opponent offense expected to score — proxy for run environment vs hitter)
+        opp_team = ""
+        away_u = (player.away_team or "").strip().upper()
+        home_u = (player.home_team or "").strip().upper()
+        if player_team and away_u and home_u:
+            if player_team == away_u:
+                opp_team = home_u
+            elif player_team == home_u:
+                opp_team = away_u
+
+        if opp_team and "opp_runs_allowed_30d" in feature_cols:
+            opp_implied = self._vegas_implied.get(opp_team)
+            if opp_implied is not None and opp_implied > 0:
+                row_dict["opp_runs_allowed_30d"] = opp_implied
+
         # Override pre-game context features
         row_dict["run_diff"] = 0.0
         row_dict["is_close_game"] = 1.0  # assume close pre-game
@@ -607,6 +646,36 @@ class SlateInference:
 
         return adj_q15, adj_q50, adj_q85
 
+    def _load_vegas_implied_totals(self) -> dict[str, float]:
+        """Fetch today's Vegas implied totals keyed by team abbreviation.
+
+        Returns dict mapping team abbr -> implied total runs.
+        Falls back to empty dict on any failure — callers use
+        team_runs_per_game_30d from cached features when missing.
+        """
+        try:
+            odds = OddsIngestion()
+            df = odds.get_mlb_implied_totals()
+            if df is None or df.empty:
+                return {}
+            result: dict[str, float] = {}
+            for _, row in df.iterrows():
+                team = str(row.get("team", "")).strip().upper()
+                implied = float(row.get("implied_total", 0))
+                if team and implied > 0:
+                    result[team] = implied
+            logger.info(f"Vegas implied totals loaded: {len(result)} teams")
+            return result
+        except Exception as exc:
+            logger.warning(
+                f"Vegas implied totals failed: {exc} — using cached features"
+            )
+            return {}
+
+    def load_vegas(self) -> None:
+        """Load today's Vegas implied totals. Call before build_projections()."""
+        self._vegas_implied = self._load_vegas_implied_totals()
+
     def build_projections(
         self,
         players: list[DKPlayer],
@@ -631,6 +700,9 @@ class SlateInference:
         """
         if not self._name_to_mlbam:
             self._build_name_lookup()
+
+        if not self._vegas_implied:
+            self.load_vegas()
 
         projections = []
         matched = 0
