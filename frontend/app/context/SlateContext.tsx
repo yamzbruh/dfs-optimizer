@@ -70,6 +70,36 @@ export interface SlateInfo {
   file_name?: string;
   display_date?: string;
   lock_time?: string;
+  /** Set when slate was chosen via ``POST /api/select-slate`` */
+  draft_group_id?: number;
+  lock_time_et?: string;
+  csv_path?: string;
+}
+
+/** One row from ``GET /api/slates`` */
+export interface DraftGroupSlateRow {
+  dg: number;
+  name: string;
+  lock_time: string;
+  lock_time_et: string;
+  contest_count: number;
+  csv_path: string | null;
+  csv_exists: boolean;
+}
+
+export interface SelectSlateApiResponse {
+  dg: number;
+  csv_path: string;
+  lock_time: string;
+  lock_time_et: string;
+  player_count: number;
+  pitcher_count: number;
+  hitter_count: number;
+  game_count: number;
+  team_count: number;
+  games: string[];
+  sha256: string;
+  players: PlayerResponse[];
 }
 
 export interface ModelInfoResponse {
@@ -292,6 +322,10 @@ interface SlateContextValue {
   unbanPlayer: (dk_id: string) => void;
   fetchModelInfo: () => Promise<void>;
   fetchHealth: () => Promise<void>;
+  /** Today's DK slates (no global loading spinner). */
+  fetchTodaysSlates: () => Promise<DraftGroupSlateRow[]>;
+  /** Select slate by draft group; loads players and runs projections. */
+  selectSlateByDg: (dg: number) => Promise<boolean>;
 }
 
 const SlateContext = createContext<SlateContextValue | null>(null);
@@ -408,6 +442,72 @@ export function SlateProvider({ children }: { children: ReactNode }) {
           file_name: file.name,
           display_date: dispDate ?? undefined,
           lock_time: lockIso ?? undefined,
+          draft_group_id: undefined,
+          lock_time_et: undefined,
+          csv_path: undefined,
+        });
+        const projRes = await fetch(`${API_BASE}/api/projections`, {
+          method: "POST",
+        });
+        if (!projRes.ok) throw new Error(await readApiError(projRes));
+        const projList = (await projRes.json()) as ProjectionResponse[];
+        setProjections(projList);
+        await fetchLineupStatus();
+        return true;
+      });
+      return ok === true;
+    },
+    [withRequest, fetchLineupStatus]
+  );
+
+  const fetchTodaysSlates = useCallback(async (): Promise<DraftGroupSlateRow[]> => {
+    try {
+      const res = await fetch(`${API_BASE}/api/slates`);
+      if (!res.ok) {
+        setError(await readApiError(res));
+        return [];
+      }
+      return (await res.json()) as DraftGroupSlateRow[];
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(msg);
+      return [];
+    }
+  }, []);
+
+  const selectSlateByDg = useCallback(
+    async (dg: number): Promise<boolean> => {
+      const ok = await withRequest(async () => {
+        const res = await fetch(
+          `${API_BASE}/api/select-slate?dg=${encodeURIComponent(String(dg))}`,
+          { method: "POST" }
+        );
+        if (!res.ok) throw new Error(await readApiError(res));
+        const data = (await res.json()) as SelectSlateApiResponse;
+        setPlayers(data.players);
+        setProjections([]);
+        setLineups([]);
+        setLockedIds(new Set());
+        setBannedIds(new Set());
+        setOwnershipSimsApplied(null);
+        setLineupStatus(null);
+        const firstGi = data.players.find((p) => p.game_info)?.game_info ?? "";
+        const lockIsoFromGi = parseLockIsoFromGameInfo(firstGi);
+        const dispDate = displayDateFromGameInfo(firstGi);
+        setSlateInfo({
+          player_count: data.player_count,
+          pitcher_count: data.pitcher_count,
+          hitter_count: data.hitter_count,
+          game_count: data.game_count,
+          team_count: data.team_count,
+          games: data.games,
+          sha256: data.sha256,
+          file_name: `DKSalaries_dg${data.dg}.csv`,
+          display_date: dispDate ?? undefined,
+          lock_time: data.lock_time || lockIsoFromGi || undefined,
+          draft_group_id: data.dg,
+          lock_time_et: data.lock_time_et,
+          csv_path: data.csv_path,
         });
         const projRes = await fetch(`${API_BASE}/api/projections`, {
           method: "POST",
@@ -579,6 +679,8 @@ export function SlateProvider({ children }: { children: ReactNode }) {
       unbanPlayer,
       fetchModelInfo,
       fetchHealth,
+      fetchTodaysSlates,
+      selectSlateByDg,
     }),
     [
       players,
@@ -604,6 +706,8 @@ export function SlateProvider({ children }: { children: ReactNode }) {
       unbanPlayer,
       fetchModelInfo,
       fetchHealth,
+      fetchTodaysSlates,
+      selectSlateByDg,
     ]
   );
 

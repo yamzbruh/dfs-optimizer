@@ -2,6 +2,8 @@
 
 Endpoints
 ---------
+* ``GET /api/slates`` — today's DK draft groups + salary CSV status
+* ``POST /api/select-slate`` — load slate by ``dg`` (salary CSV from disk or DK)
 * ``POST /api/upload`` — upload DK salary CSV, parse, return player pool
 * ``POST /api/projections`` — build projections via ``SlateInference`` (XGBoost)
   when initialized; otherwise DK avg fallback
@@ -188,6 +190,35 @@ class LineupStatusPayload(BaseModel):
     auto_banned_ids: list[str]
 
 
+class SlateInfoRow(BaseModel):
+    """One DraftKings MLB Classic slate for today (draft group)."""
+
+    dg: int
+    name: str
+    lock_time: str
+    lock_time_et: str
+    contest_count: int
+    csv_path: str | None
+    csv_exists: bool
+
+
+class SelectSlateResponse(BaseModel):
+    """Slate selected from automation / DK draft group (mirrors upload + dg)."""
+
+    dg: int
+    csv_path: str
+    lock_time: str
+    lock_time_et: str
+    player_count: int
+    pitcher_count: int
+    hitter_count: int
+    game_count: int
+    team_count: int
+    games: list[str]
+    sha256: str
+    players: list[PlayerResponse]
+
+
 # ---------------------------------------------------------------------------
 # Startup — load latest trained quantile models (if present)
 # ---------------------------------------------------------------------------
@@ -302,6 +333,24 @@ def _primary_slot_label(p: DKPlayer) -> str:
     return p.dk_position or (p.position_eligibility[0] if p.position_eligibility else "")
 
 
+def _players_to_responses(players: list[DKPlayer]) -> list[PlayerResponse]:
+    return [
+        PlayerResponse(
+            dk_id=p.dk_id,
+            name=p.name,
+            team=p.team,
+            opponent=_opponent_for_player(p),
+            position=_primary_slot_label(p),
+            position_eligibility=list(p.position_eligibility),
+            salary=p.salary,
+            avg_points_per_game=float(p.avg_points_per_game),
+            is_pitcher=p.is_pitcher,
+            game_info=p.game_info_raw or "",
+        )
+        for p in players
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -361,21 +410,7 @@ async def upload_csv(file: UploadFile = File(...)) -> UploadResponse:
         )
         teams = sorted({p.team for p in result.players if p.team})
 
-        players_resp = [
-            PlayerResponse(
-                dk_id=p.dk_id,
-                name=p.name,
-                team=p.team,
-                opponent=_opponent_for_player(p),
-                position=_primary_slot_label(p),
-                position_eligibility=list(p.position_eligibility),
-                salary=p.salary,
-                avg_points_per_game=float(p.avg_points_per_game),
-                is_pitcher=p.is_pitcher,
-                game_info=p.game_info_raw or "",
-            )
-            for p in result.players
-        ]
+        players_resp = _players_to_responses(result.players)
 
         _upload_meta = {
             "player_count": len(result.players),
@@ -400,6 +435,95 @@ async def upload_csv(file: UploadFile = File(...)) -> UploadResponse:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     finally:
         Path(tmp.name).unlink(missing_ok=True)
+
+
+@app.get("/api/slates", response_model=list[SlateInfoRow])
+async def get_todays_slates() -> list[SlateInfoRow]:
+    """Return all available slates for today with their salary CSV status."""
+    from automation.scheduler import _get_todays_slates
+
+    slates = _get_todays_slates()
+    result: list[SlateInfoRow] = []
+    for s in slates:
+        lt = s["lock_time"]
+        lock_iso = lt.isoformat() if hasattr(lt, "isoformat") else str(lt)
+        lock_et = s["lock_time_et"]
+        csv_path = s.get("csv_path")
+        csv_str = str(csv_path) if csv_path else None
+        exists = bool(csv_path and Path(csv_path).exists())
+        result.append(
+            SlateInfoRow(
+                dg=int(s["dg"]),
+                name=str(s.get("name", "")),
+                lock_time=lock_iso,
+                lock_time_et=lock_et,
+                contest_count=int(s.get("contest_count", 0)),
+                csv_path=csv_str,
+                csv_exists=exists,
+            )
+        )
+    return result
+
+
+@app.post("/api/select-slate", response_model=SelectSlateResponse)
+async def select_slate(dg: int = Query(..., description="DraftKings draft group id")) -> SelectSlateResponse:
+    """Select a slate by draft group ID and load its salary CSV."""
+    global _current_players, _current_projections, _current_lineups
+    global _auto_banned_ids, _lineup_status_report
+
+    from automation.scheduler import _download_salary_csv, _get_todays_slates
+
+    slates = _get_todays_slates()
+    slate = next((s for s in slates if int(s["dg"]) == int(dg)), None)
+    if not slate:
+        raise HTTPException(status_code=404, detail=f"Slate dg={dg} not found")
+
+    csv_path = slate.get("csv_path")
+    if not csv_path or not Path(csv_path).exists():
+        csv_path = _download_salary_csv(int(dg), slate["lock_time"])
+    if not csv_path:
+        raise HTTPException(status_code=500, detail="Failed to download salary CSV")
+
+    _parser.parse(str(csv_path))
+    result = _parser.last_result
+    if not result.players:
+        raise HTTPException(
+            status_code=422, detail="No players parsed from salary CSV"
+        )
+
+    _current_players = result.players
+    _current_projections = []
+    _current_lineups = []
+    _auto_banned_ids = set()
+    _lineup_status_report = []
+    if _status_checker is not None:
+        _status_checker.reset_cache()
+
+    games = sorted(
+        {
+            f"{p.away_team}@{p.home_team}"
+            for p in result.players
+            if p.away_team and p.home_team
+        }
+    )
+    teams = sorted({p.team for p in result.players if p.team})
+    players_resp = _players_to_responses(result.players)
+    lock_iso = slate["lock_time"].isoformat()
+
+    return SelectSlateResponse(
+        dg=int(dg),
+        csv_path=str(csv_path),
+        lock_time=lock_iso,
+        lock_time_et=str(slate["lock_time_et"]),
+        player_count=len(result.players),
+        pitcher_count=sum(1 for p in result.players if p.is_pitcher),
+        hitter_count=sum(1 for p in result.players if not p.is_pitcher),
+        game_count=len(games),
+        team_count=len(teams),
+        games=games,
+        sha256=(result.file_hash or "")[:12],
+        players=players_resp,
+    )
 
 
 @app.post("/api/projections", response_model=list[ProjectionResponse])

@@ -1,7 +1,8 @@
 "use client";
 
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 import { useSlate } from "@/app/context/SlateContext";
+import type { DraftGroupSlateRow } from "@/app/context/SlateContext";
 import PlayerTable from "@/components/PlayerTable";
 import StatBadge from "@/components/StatBadge";
 
@@ -11,6 +12,8 @@ export default function SlatePage() {
     playerPool,
     projections,
     uploadCSV,
+    fetchTodaysSlates,
+    selectSlateByDg,
     loading,
     error,
     lockedIds,
@@ -25,7 +28,24 @@ export default function SlatePage() {
     ok: boolean;
     text: string;
   } | null>(null);
+  const [todaysSlates, setTodaysSlates] = useState<DraftGroupSlateRow[]>([]);
+  const [slatesLoaded, setSlatesLoaded] = useState(false);
+  const [showManualUpload, setShowManualUpload] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const rows = await fetchTodaysSlates();
+      if (!cancelled) {
+        setTodaysSlates(rows);
+        setSlatesLoaded(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [fetchTodaysSlates]);
 
   async function handleFile(file: File) {
     if (!file.name.toLowerCase().endsWith(".csv")) {
@@ -38,6 +58,7 @@ export default function SlatePage() {
     setFileBanner(null);
     const ok = await uploadCSV(file);
     if (ok) {
+      setShowManualUpload(false);
       setFileBanner({
         ok: true,
         text: "Salary file ingested and projections refreshed.",
@@ -63,6 +84,21 @@ export default function SlatePage() {
     if (bannedIds.has(p.dk_id)) unbanPlayer(p.dk_id);
     else banPlayer(p.dk_id);
   };
+
+  async function handleSelectSlate(dg: number) {
+    setFileBanner(null);
+    const ok = await selectSlateByDg(dg);
+    if (ok) {
+      setShowManualUpload(false);
+      setFileBanner({
+        ok: true,
+        text: `Slate dg=${dg} loaded — projections refreshed.`,
+      });
+    }
+  }
+
+  const slateFromApi = Boolean(slateInfo?.draft_group_id);
+  const hideUploadZone = slateFromApi && !showManualUpload;
 
   const emptySlate = !slateInfo;
 
@@ -95,23 +131,128 @@ export default function SlatePage() {
         </div>
       )}
 
-      {emptySlate && !loading && (
+      {emptySlate && !loading && slatesLoaded && todaysSlates.length === 0 && (
         <div
           className="rounded-lg px-6 py-10 text-center"
           style={{ backgroundColor: "#0f1629", border: "1px solid #1e2d4a" }}
         >
           <div className="text-3xl mb-3">📋</div>
           <p className="text-slate-300 font-semibold mb-1">
-            Upload a DK salary CSV to get started
+            No automated slates found for today
           </p>
           <p className="text-xs text-slate-500">
-            Drop a file below or browse — the slate will parse on the API and
-            projections will build automatically.
+            Use manual CSV upload below, or wait for the morning automation job.
           </p>
         </div>
       )}
 
+      {emptySlate && !loading && (!slatesLoaded || todaysSlates.length > 0) && (
+        <div
+          className="rounded-lg px-6 py-10 text-center"
+          style={{ backgroundColor: "#0f1629", border: "1px solid #1e2d4a" }}
+        >
+          <div className="text-3xl mb-3">📋</div>
+          <p className="text-slate-300 font-semibold mb-1">
+            Select a slate or upload a DK salary CSV
+          </p>
+          <p className="text-xs text-slate-500">
+            Choose a draft group above, or drop a file in the upload zone.
+          </p>
+        </div>
+      )}
+
+      {/* Today's DK slates (draft groups) */}
+      <section className="mb-2">
+        <h2
+          className="text-xs font-semibold uppercase tracking-widest mb-3"
+          style={{ color: "#00ff88" }}
+        >
+          00 — Today&apos;s slates
+        </h2>
+        {!slatesLoaded ? (
+          <p className="text-xs text-slate-500">Loading slates…</p>
+        ) : todaysSlates.length === 0 ? (
+          <p className="text-xs text-slate-500">
+            No slates from the API. You can still upload a salary CSV manually.
+          </p>
+        ) : (
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {todaysSlates.map((s) => (
+              <button
+                key={s.dg}
+                type="button"
+                disabled={loading}
+                onClick={() => void handleSelectSlate(s.dg)}
+                className="text-left rounded-lg p-4 transition-all duration-150 border"
+                style={{
+                  backgroundColor:
+                    slateInfo?.draft_group_id === s.dg ? "#0a2818" : "#0f1629",
+                  borderColor:
+                    slateInfo?.draft_group_id === s.dg ? "#00ff8860" : "#1e2d4a",
+                  cursor: loading ? "not-allowed" : "pointer",
+                  opacity: loading ? 0.6 : 1,
+                }}
+              >
+                <div className="text-[10px] uppercase tracking-wider text-slate-500 mb-1">
+                  Draft group
+                </div>
+                <div
+                  className="font-data text-lg font-semibold mb-2"
+                  style={{ color: "#00ff88" }}
+                >
+                  dg={s.dg}
+                </div>
+                <div className="text-xs text-slate-300 mb-1 line-clamp-2">
+                  {s.name}
+                </div>
+                <div className="text-xs text-slate-500 mb-2">
+                  Lock {s.lock_time_et} · {s.contest_count} contests
+                </div>
+                <div className="text-xs font-medium">
+                  {s.csv_exists ? (
+                    <span style={{ color: "#00ff88" }}>✅ CSV ready</span>
+                  ) : (
+                    <span style={{ color: "#f59e0b" }}>❌ CSV not on disk</span>
+                  )}
+                </div>
+              </button>
+            ))}
+          </div>
+        )}
+      </section>
+
+      {slateFromApi && (
+        <div
+          className="mb-4 rounded-lg px-4 py-3 text-sm flex flex-wrap items-center justify-between gap-2"
+          style={{
+            backgroundColor: "rgba(0,255,136,0.08)",
+            border: "1px solid #00ff8840",
+            color: "#86efac",
+          }}
+        >
+          <span>
+            <strong>Selected slate</strong> · dg={slateInfo!.draft_group_id} · Lock{" "}
+            {slateInfo!.lock_time_et ?? "—"} ·{" "}
+            {slateInfo!.csv_path ? (
+              <span className="text-slate-400 font-mono text-xs">
+                {slateInfo!.csv_path}
+              </span>
+            ) : null}
+          </span>
+          {!showManualUpload && (
+            <button
+              type="button"
+              className="text-xs underline text-slate-400 hover:text-slate-200"
+              onClick={() => setShowManualUpload(true)}
+            >
+              Upload CSV manually instead
+            </button>
+          )}
+        </div>
+      )}
+
       {/* Upload Zone */}
+      {!hideUploadZone && (
       <section>
         <h2
           className="text-xs font-semibold uppercase tracking-widest mb-4"
@@ -193,6 +334,7 @@ export default function SlatePage() {
           </div>
         )}
       </section>
+      )}
 
       {!emptySlate && (
         <>
@@ -229,13 +371,14 @@ export default function SlatePage() {
                 },
                 {
                   value:
-                    slateInfo!.lock_time &&
+                    slateInfo!.lock_time_et ??
+                    (slateInfo!.lock_time &&
                     !Number.isNaN(new Date(slateInfo!.lock_time).getTime())
                       ? new Date(slateInfo!.lock_time).toLocaleTimeString([], {
                           hour: "2-digit",
                           minute: "2-digit",
                         })
-                      : "--:--",
+                      : "--:--"),
                   label: "Lock Time",
                   color: "amber" as const,
                 },
