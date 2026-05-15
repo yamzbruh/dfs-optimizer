@@ -646,6 +646,29 @@ class SlateInference:
 
         return adj_q15, adj_q50, adj_q85
 
+    def _apply_vegas_multiplier(
+        self,
+        q15: float,
+        q50: float,
+        q85: float,
+        player_team: str,
+    ) -> tuple[float, float, float]:
+        """Apply Vegas implied total as a post-model multiplier on q50 and q85.
+
+        multiplier = clip(implied_total / 4.5, 0.75, 1.25)
+        Applied to q50 and q85 only — q15 (floor) is unchanged.
+
+        4.5 = MLB average implied runs per game.
+        Clip prevents extreme adjustments on very high/low totals.
+        """
+        implied = self._vegas_implied.get(player_team)
+        if implied is None or implied <= 0:
+            return q15, q50, q85
+
+        multiplier = max(0.75, min(1.25, implied / 4.5))
+
+        return q15, round(q50 * multiplier, 4), round(q85 * multiplier, 4)
+
     def _load_vegas_implied_totals(self) -> dict[str, float]:
         """Fetch today's Vegas implied totals keyed by team abbreviation.
 
@@ -783,6 +806,13 @@ class SlateInference:
                 pa_30d = self._get_pa_count_30d(mlbam_id)
                 q15, q50, q85 = self._confidence_weight_projection(
                     q15, q50, q85, pa_30d
+                )
+
+            # Apply Vegas implied total multiplier to q50 and q85
+            if not player.is_pitcher:
+                player_team = (player.team or "").strip().upper()
+                q15, q50, q85 = self._apply_vegas_multiplier(
+                    q15, q50, q85, player_team
                 )
 
             # Unmatched players use DK avg fallback as-is.
