@@ -12,7 +12,7 @@ Pipeline order for the full batter feature matrix::
                                           xwoba_babip_gap_7d luck signal)
         → build_platoon_features         (platoon_advantage / same_hand)
         → build_game_context_features    (no-op — leaky features removed)
-        → build_park_factor_features     (park_factor from PARK_FACTORS lookup)
+        → build_park_factor_features     (park_factor from FANGRAPHS_PARK_FACTORS)
         → build_dk_points_labels         (PA-level: hits / walks / HBP only)
         → aggregate_to_game_level        (sum PA dk_points → dk_points_game)
         → join_game_log_features_game_level  (R / RBI / SB → dk_points_game)
@@ -77,40 +77,45 @@ ORDER_MULTIPLIERS: dict[int, float] = {
     9: 0.85,
 }
 
-# Park run-factor lookup (multi-year average, 1.0 = neutral).
-# > 1.0 = hitter-friendly, < 1.0 = pitcher-friendly.
-PARK_FACTORS: dict[str, float] = {
-    "COL": 1.146,  # Coors Field
-    "CIN": 1.072,  # Great American Ball Park
-    "BOS": 1.058,  # Fenway Park
+# FanGraphs 5-year regressed park factors (2020–2024 baseline). 1.0 = neutral.
+FANGRAPHS_PARK_FACTORS: dict[str, float] = {
+    # Hitter friendly (>1.0)
+    "COL": 1.122,  # Coors Field
+    "CIN": 1.071,  # Great American Ball Park
+    "PHI": 1.048,  # Citizens Bank Park
     "TEX": 1.044,  # Globe Life Field
-    "PHI": 1.038,  # Citizens Bank Park
-    "MIL": 1.031,  # American Family Field
-    "NYY": 1.028,  # Yankee Stadium
-    "BAL": 1.024,  # Camden Yards
-    "ATL": 1.018,  # Truist Park
-    "HOU": 1.012,  # Minute Maid Park
-    "LAA": 1.008,  # Angel Stadium
-    "MIN": 1.004,  # Target Field
-    "ARI": 1.002,  # Chase Field
-    "DET": 0.998,  # Comerica Park
-    "WSH": 0.995,  # Nationals Park
-    "TOR": 0.992,  # Rogers Centre
-    "CHC": 0.989,  # Wrigley Field
-    "CWS": 0.985,  # Guaranteed Rate Field
-    "STL": 0.982,  # Busch Stadium
-    "KCR": 0.979,  # Kauffman Stadium
-    "CLE": 0.976,  # Progressive Field
-    "NYM": 0.973,  # Citi Field
-    "TB":  0.970,  # Tropicana Field
-    "MIA": 0.967,  # loanDepot Park
-    "OAK": 0.964,  # Oakland Coliseum
-    "LAD": 0.961,  # Dodger Stadium
-    "SEA": 0.958,  # T-Mobile Park
-    "SF":  0.955,  # Oracle Park
-    "SD":  0.952,  # Petco Park
-    "PIT": 0.949,  # PNC Park
+    "NYY": 1.038,  # Yankee Stadium
+    "ATL": 1.035,  # Truist Park
+    "MIL": 1.028,  # American Family Field
+    "BOS": 1.025,  # Fenway Park
+    "CHC": 1.022,  # Wrigley Field
+    "HOU": 1.018,  # Minute Maid Park
+    "ARI": 1.015,  # Chase Field
+    "BAL": 1.012,  # Camden Yards
+    "TOR": 1.010,  # Rogers Centre
+    "MIN": 1.008,  # Target Field
+    "DET": 1.005,  # Comerica Park
+    # Neutral (~1.0)
+    "NYM": 1.000,  # Citi Field
+    "WSH": 0.998,  # Nationals Park
+    "STL": 0.997,  # Busch Stadium
+    "CLE": 0.995,  # Progressive Field
+    "LAA": 0.993,  # Angel Stadium
+    "KC": 0.991,  # Kauffman Stadium
+    "LAD": 0.991,  # Dodger Stadium
+    "PIT": 0.988,  # PNC Park
+    "ATH": 0.985,  # Sutter Health Park (Sacramento — use neutral)
+    "CWS": 0.983,  # Guaranteed Rate Field
+    # Pitcher friendly (<1.0)
+    "TB": 0.978,  # Tropicana Field
+    "SEA": 0.975,  # T-Mobile Park
+    "MIA": 0.972,  # loanDepot Park
+    "SD": 0.968,  # Petco Park
+    "SF": 0.955,  # Oracle Park
+    "OAK": 0.952,  # Oakland Coliseum (historical)
 }
+
+MLB_AVG_PARK_FACTOR = 1.000
 
 # Columns excluded from the training feature set.
 _LABEL_AND_ID_COLS: set[str] = {"batter", "game_date", "events", "dk_points"}
@@ -518,18 +523,11 @@ class FeatureEngineer:
         return df if df is not None else pd.DataFrame()
 
     def build_park_factor_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add a ballpark run-factor column based on the home team.
+        """Add FanGraphs 5-year regressed park factors (2020-2024 baseline).
 
-        Looks up ``home_team`` in ``PARK_FACTORS``.  Unknown teams default
-        to ``1.0`` (neutral park).
-
-        Column added: ``park_factor``
-
-        Args:
-            df: Statcast DataFrame with a ``home_team`` column.
-
-        Returns:
-            New DataFrame with ``park_factor`` appended.
+        Uses home_team column to look up park factor.
+        Falls back to 1.0 (neutral) for unknown venues.
+        ATH uses Sacramento park factor (neutral) as 2026 is first season.
         """
         if df is None or df.empty:
             logger.warning("build_park_factor_features: empty input")
@@ -539,17 +537,24 @@ class FeatureEngineer:
 
         if "home_team" not in result.columns:
             logger.warning(
-                "build_park_factor_features: 'home_team' column missing; "
-                "park_factor defaulting to 1.0"
+                "build_park_factor_features: home_team missing — defaulting to 1.0"
             )
-            result["park_factor"] = 1.0
+            result["park_factor"] = MLB_AVG_PARK_FACTOR
             return result
 
-        result["park_factor"] = result["home_team"].map(PARK_FACTORS).fillna(1.0)
-        known = result["park_factor"].ne(1.0).sum()
+        result["park_factor"] = (
+            result["home_team"]
+            .str.strip()
+            .str.upper()
+            .map(FANGRAPHS_PARK_FACTORS)
+            .fillna(MLB_AVG_PARK_FACTOR)
+        )
+
         logger.info(
-            f"build_park_factor_features: park_factor added "
-            f"({known:,} rows matched a known park)"
+            f"build_park_factor_features: "
+            f"mean={result['park_factor'].mean():.3f}, "
+            f"min={result['park_factor'].min():.3f}, "
+            f"max={result['park_factor'].max():.3f}"
         )
         return result
 
