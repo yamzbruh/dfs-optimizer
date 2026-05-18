@@ -62,6 +62,9 @@ class PitcherFeatureEngineer:
             "ip_per_start_7d",
             "ip_per_start_14d",
             "ip_per_start_30d",
+            "ip_per_appearance_7d",
+            "ip_per_appearance_14d",
+            "ip_per_appearance_30d",
             # Rolling ERA-style ratio
             "era_approx_14d",
             "era_approx_30d",
@@ -352,15 +355,20 @@ class PitcherFeatureEngineer:
         return result
 
     def build_ip_per_start_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Rolling mean innings pitched over the last 7 / 14 / 30 games.
+        """Rolling IP / appearance metrics over the last 7 / 14 / 30 games.
 
         Uses ``innings_pitched`` from the merged game log (decimal innings).
+
+        * ``ip_per_start_{w}d`` — rolling mean IP per game row (legacy starter proxy).
+        * ``ip_per_appearance_{w}d`` — total IP in window / total appearances
+          (all games), with ``shift(1)`` so the current outing is excluded.
 
         Args:
             df: Pitcher-game DataFrame sorted by ``pitcher``, ``game_date``.
 
         Returns:
-            New DataFrame with ``ip_per_start_*d`` and ``is_starter`` columns.
+            New DataFrame with ``ip_per_start_*d``, ``ip_per_appearance_*d``,
+            and ``is_starter`` columns.
         """
         if df is None or df.empty:
             logger.warning("build_ip_per_start_features: empty input")
@@ -370,15 +378,27 @@ class PitcherFeatureEngineer:
         if "innings_pitched" not in result.columns:
             for w in (7, 14, 30):
                 result[f"ip_per_start_{w}d"] = 0.0
+                result[f"ip_per_appearance_{w}d"] = 0.0
             result["is_starter"] = 0.0
             return result
 
         result = result.sort_values(["pitcher", "game_date"]).reset_index(drop=True)
         g = result.groupby("pitcher", sort=False)["innings_pitched"]
+
+        def _ip_per_appearance(s: pd.Series, window: int) -> pd.Series:
+            prior_ip = s.fillna(0.0).shift(1)
+            ip_sum = prior_ip.rolling(window, min_periods=1).sum()
+            n_apps = prior_ip.rolling(window, min_periods=1).count()
+            return (ip_sum / n_apps.replace(0, np.nan)).fillna(0.0)
+
         for w in (7, 14, 30):
             result[f"ip_per_start_{w}d"] = g.transform(
                 lambda s, ww=w: s.rolling(ww, min_periods=1).mean()
             ).fillna(0.0)
+            result[f"ip_per_appearance_{w}d"] = g.transform(
+                lambda s, ww=w: _ip_per_appearance(s, ww)
+            )
+
         result["is_starter"] = (result["ip_per_start_7d"] >= 3.0).astype(float)
         return result
 
