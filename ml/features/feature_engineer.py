@@ -10,7 +10,7 @@ Pipeline order for the full batter feature matrix::
         → build_rolling_batter_features  (xwOBA / EV / barrel / HH / K% / BB%
                                           rolling, EV–barrel–HH 7d-vs-30d trends,
                                           xwoba_babip_gap_7d luck signal)
-        → build_platoon_features         (platoon_advantage / same_hand)
+        → build_platoon_features         (xwoba_vs_hand_30d / platoon_split_magnitude)
         → build_game_context_features    (no-op — leaky features removed)
         → build_park_factor_features     (park_factor from FANGRAPHS_PARK_FACTORS)
         → build_dk_points_labels         (PA-level: hits / walks / HBP only)
@@ -370,24 +370,22 @@ class FeatureEngineer:
         )
         return result
 
-    def build_platoon_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add platoon-advantage and same-hand matchup indicator columns.
+    def build_platoon_features(self, df: pd.DataFrame, years: list[int]) -> pd.DataFrame:
+        """Build continuous platoon split features from Statcast data.
 
-        Platoon advantage is conventionally held by the batter when they
-        face a pitcher of opposite handedness (L vs R or R vs L).
+        Replaces binary platoon_advantage and same_hand with:
 
-        Columns added:
+        xwoba_vs_hand_30d: batter's rolling xwOBA specifically against
+            today's opposing pitcher hand (R or L) over last 30 days.
+            This is the key matchup quality signal.
 
-        * ``platoon_advantage`` — 1 when batter faces opposite-handed
-          pitcher, 0 otherwise.
-        * ``same_hand`` — 1 when batter and pitcher are same-handed,
-          0 otherwise.
+        platoon_split_magnitude: abs(xwOBA vs R - xwOBA vs L) averaged
+            over the last 30 days. High = strong platoon player,
+            low = platoon-neutral batter.
 
-        Args:
-            df: Statcast DataFrame with ``stand`` and ``p_throws`` columns.
-
-        Returns:
-            New DataFrame with platoon columns appended.
+        Both features require p_throws and estimated_woba_using_speedangle
+        from Statcast. Falls back to xwoba_30d for xwoba_vs_hand_30d
+        and 0.0 for platoon_split_magnitude when data is insufficient.
         """
         if df is None or df.empty:
             logger.warning("build_platoon_features: empty input")
@@ -395,29 +393,97 @@ class FeatureEngineer:
 
         result = df.copy()
 
-        missing = [c for c in ("stand", "p_throws") if c not in result.columns]
-        if missing:
-            logger.warning(
-                f"build_platoon_features: missing columns {missing}; "
-                "platoon_advantage and same_hand will be 0"
+        MLB_AVG_XWOBA = 0.320  # fallback when insufficient split data
+
+        logger.info(
+            f"build_platoon_features: computing for {len(result):,} rows — "
+            "this may take several minutes"
+        )
+
+        # Load Statcast data for all years
+        frames = []
+        for year in years:
+            key = f"statcast/batters_{year}"
+            raw = self.cache.load(key)
+            if raw is None or raw.empty:
+                continue
+            needed = [
+                "batter",
+                "game_date",
+                "p_throws",
+                "estimated_woba_using_speedangle",
+            ]
+            if not all(c in raw.columns for c in needed):
+                continue
+            frames.append(
+                raw[needed].dropna(subset=["estimated_woba_using_speedangle"])
             )
-            result["platoon_advantage"] = 0
-            result["same_hand"] = 0
+
+        if not frames:
+            logger.warning("build_platoon_features: no Statcast data — using fallbacks")
+            result["xwoba_vs_hand_30d"] = result.get("xwoba_30d", MLB_AVG_XWOBA)
+            result["platoon_split_magnitude"] = 0.0
             return result
 
-        result["platoon_advantage"] = (
-            (
-                (result["stand"] == "L") & (result["p_throws"] == "R")
-            ) | (
-                (result["stand"] == "R") & (result["p_throws"] == "L")
+        sc = pd.concat(frames, ignore_index=True)
+        sc["game_date"] = pd.to_datetime(sc["game_date"])
+        sc = sc.sort_values(["batter", "game_date"]).reset_index(drop=True)
+
+        result = result.sort_values(["batter", "game_date"]).reset_index(drop=True)
+        result["game_date"] = pd.to_datetime(result["game_date"])
+
+        xwoba_vs_hand = []
+        split_magnitude = []
+
+        for _, row in result.iterrows():
+            batter_id = row["batter"]
+            gdate = row["game_date"]
+            p_hand = row.get("p_throws", "R")
+
+            cutoff = gdate - pd.Timedelta(days=30)
+
+            batter_rows = sc[
+                (sc["batter"] == batter_id)
+                & (sc["game_date"] >= cutoff)
+                & (sc["game_date"] < gdate)
+            ]
+
+            if batter_rows.empty:
+                xwoba_vs_hand.append(row.get("xwoba_30d", MLB_AVG_XWOBA))
+                split_magnitude.append(0.0)
+                continue
+
+            # xwOBA vs today's pitcher hand
+            vs_hand = batter_rows[batter_rows["p_throws"] == p_hand][
+                "estimated_woba_using_speedangle"
+            ]
+            xwoba_vs_hand.append(
+                vs_hand.mean()
+                if len(vs_hand) >= 3
+                else row.get("xwoba_30d", MLB_AVG_XWOBA)
             )
-        ).astype(int)
 
-        result["same_hand"] = (
-            result["stand"] == result["p_throws"]
-        ).astype(int)
+            # Split magnitude: abs difference between vs R and vs L
+            vs_r = batter_rows[batter_rows["p_throws"] == "R"][
+                "estimated_woba_using_speedangle"
+            ]
+            vs_l = batter_rows[batter_rows["p_throws"] == "L"][
+                "estimated_woba_using_speedangle"
+            ]
 
-        logger.info("build_platoon_features: platoon_advantage and same_hand added")
+            if len(vs_r) >= 3 and len(vs_l) >= 3:
+                split_magnitude.append(abs(vs_r.mean() - vs_l.mean()))
+            else:
+                split_magnitude.append(0.0)
+
+        result["xwoba_vs_hand_30d"] = xwoba_vs_hand
+        result["platoon_split_magnitude"] = split_magnitude
+
+        logger.info(
+            f"build_platoon_features: "
+            f"xwoba_vs_hand mean={result['xwoba_vs_hand_30d'].mean():.3f}, "
+            f"split_mag mean={result['platoon_split_magnitude'].mean():.3f}"
+        )
         return result
 
     def build_batting_order_features(
@@ -1083,7 +1149,7 @@ class FeatureEngineer:
           (renamed to ``pa_count``).
         * **LAST**: rolling ``*_{7,14,30}d`` columns (excluding
           ``xwoba_babip_gap_7d``), ``barrel_rate_trend``, ``hard_hit_trend``,
-          ``exit_velo_trend``, ``platoon_advantage``, ``same_hand``,
+          ``exit_velo_trend``, ``xwoba_vs_hand_30d``, ``platoon_split_magnitude``,
           ``batting_order_multiplier``, ``park_factor``, ``xwoba_babip_gap_7d``,
           ``k_rate_*``, ``bb_rate_*``, ``p_throws``, ``stand``.
         * **FIRST**: ``home_team``, ``away_team``, ``game_pk``.
@@ -1117,10 +1183,12 @@ class FeatureEngineer:
             c for c in result.columns
             if any(c.endswith(f"_{w}d") for w in ("7", "14", "30"))
             and c != "xwoba_babip_gap_7d"
+            and c != "xwoba_vs_hand_30d"
         ]
 
         last_cols = [c for c in (
-            "platoon_advantage", "same_hand", "batting_order_multiplier",
+            "xwoba_vs_hand_30d", "platoon_split_magnitude",
+            "batting_order_multiplier",
             "park_factor", "xwoba_babip_gap_7d", "p_throws", "stand",
             "barrel_rate_trend", "hard_hit_trend", "exit_velo_trend",
         ) if c in result.columns]
@@ -1365,7 +1433,7 @@ class FeatureEngineer:
                                                     K% / BB% rolling, short-vs-30d
                                                     trends for EV/barrel/HH, and
                                                     ``xwoba_babip_gap_7d``
-        3.  ``build_platoon_features``            — platoon advantage / same-hand
+        3.  ``build_platoon_features``            — xwoba_vs_hand_30d / platoon split
         4.  ``build_game_context_features``       — no-op (leaky features removed)
         5.  ``build_park_factor_features``        — ballpark run factor
         6.  ``build_dk_points_labels``            — PA-level DK pts (hits/walks/HBP)
@@ -1417,7 +1485,7 @@ class FeatureEngineer:
             return df
 
         df = self.build_rolling_batter_features(df)
-        df = self.build_platoon_features(df)
+        df = self.build_platoon_features(df, _years)
         df = self.build_game_context_features(df)   # no-op; leaky features removed
         df = self.build_park_factor_features(df)
         df = self.build_dk_points_labels(df)
@@ -1497,9 +1565,9 @@ class FeatureEngineer:
             *rolling_cols,
             # BABIP luck signal (xwoba vs 7d BABIP only; no raw babip_*d)
             "xwoba_babip_gap_7d",
-            # Platoon matchup
-            "platoon_advantage",
-            "same_hand",
+            # Platoon matchup (continuous splits)
+            "xwoba_vs_hand_30d",
+            "platoon_split_magnitude",
             # Batting order slot
             "batting_order_multiplier",
             # Ballpark run factor

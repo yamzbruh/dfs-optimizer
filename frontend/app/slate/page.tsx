@@ -205,8 +205,17 @@ export default function SlatePage() {
                 <div className="text-xs text-slate-300 mb-1 line-clamp-2">
                   {s.name}
                 </div>
-                <div className="text-xs text-slate-500 mb-2">
+                <div className="text-xs text-slate-500 mb-1">
                   Lock {s.lock_time_et} · {s.contest_count} contests
+                </div>
+                <div className="text-xs text-slate-500 mb-1">
+                  {s.max_entries.toLocaleString()} max entries
+                </div>
+                <div className="text-xs text-slate-500 mb-1">
+                  Top prize: ${(s.max_prize_pool / 1000).toFixed(0)}K
+                </div>
+                <div className="text-xs text-slate-500 mb-2">
+                  Current fill: {s.total_current_entries.toLocaleString()} entered
                 </div>
                 <div className="text-xs font-medium">
                   {s.csv_exists ? (

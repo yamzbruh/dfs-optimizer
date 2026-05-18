@@ -198,6 +198,9 @@ class SlateInfoRow(BaseModel):
     lock_time: str
     lock_time_et: str
     contest_count: int
+    max_entries: int
+    total_current_entries: int
+    max_prize_pool: float
     csv_path: str | None
     csv_exists: bool
 
@@ -458,6 +461,9 @@ async def get_todays_slates() -> list[SlateInfoRow]:
                 lock_time=lock_iso,
                 lock_time_et=lock_et,
                 contest_count=int(s.get("contest_count", 0)),
+                max_entries=int(s.get("max_entries", 0)),
+                total_current_entries=int(s.get("total_current_entries", 0)),
+                max_prize_pool=float(s.get("max_prize_pool", 0.0)),
                 csv_path=csv_str,
                 csv_exists=exists,
             )

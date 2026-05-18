@@ -83,6 +83,9 @@ export interface DraftGroupSlateRow {
   lock_time: string;
   lock_time_et: string;
   contest_count: number;
+  max_entries: number;
+  total_current_entries: number;
+  max_prize_pool: number;
   csv_path: string | null;
   csv_exists: boolean;
 }

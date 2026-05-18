@@ -1,4 +1,4 @@
-"""Show feature importance for hitter and pitcher models.
+"""Show feature importance for hitter, pitcher, starter, and reliever models.
 
 Usage:
     python scripts/feature_importance.py
@@ -16,7 +16,12 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from ml.training.points_model import PitcherPointsModel, PointsModel
+from ml.training.points_model import (
+    PitcherPointsModel,
+    PointsModel,
+    RelieverPointsModel,
+    StarterPointsModel,
+)
 
 
 def main() -> None:
@@ -47,6 +52,30 @@ def main() -> None:
         print(fi.to_string(index=False))
     else:
         print("No pitcher models found")
+
+    # Starter model
+    starter_files = sorted(models_dir.glob("starter_q50_*.joblib"))
+    if starter_files:
+        run_id = starter_files[-1].stem.replace("starter_q50_", "")
+        smodel = StarterPointsModel()
+        smodel.load_models(run_id)
+        fi = smodel.get_feature_importance("q50")
+        print("\n=== STARTER Q50 IMPORTANCE ===")
+        print(fi.to_string(index=False))
+    else:
+        print("\nNo starter model found")
+
+    # Reliever model
+    reliever_files = sorted(models_dir.glob("reliever_q50_*.joblib"))
+    if reliever_files:
+        run_id = reliever_files[-1].stem.replace("reliever_q50_", "")
+        rmodel = RelieverPointsModel()
+        rmodel.load_models(run_id)
+        fi = rmodel.get_feature_importance("q50")
+        print("\n=== RELIEVER Q50 IMPORTANCE ===")
+        print(fi.to_string(index=False))
+    else:
+        print("\nNo reliever model found")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 # DFS Optimizer
 
-Production MLB DraftKings GPP lineup optimizer. Generates 20 contest-ready lineups per slate using XGBoost quantile regression for points projection, an ownership model for leverage scoring, and correlated Monte Carlo simulation for portfolio construction.
+Production MLB DraftKings GPP lineup optimizer. Generates up to 150 contest-ready lineups per slate using XGBoost quantile regression for points projection, an ownership model for leverage scoring, and correlated Monte Carlo simulation for portfolio construction.
 
 ## Architecture
 

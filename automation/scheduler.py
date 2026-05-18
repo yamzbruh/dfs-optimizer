@@ -241,11 +241,30 @@ def _download_salary_csv(dg: int, lock_time: datetime) -> Path | None:
         return None
 
 
-def _get_todays_slates() -> list[dict[str, Any]]:
-    """Fetch today's MLB Classic slates from DK (one row per unique ``dg``).
+def _contest_field_int(contest: dict[str, Any], key: str, default: int = 0) -> int:
+    try:
+        return int(contest.get(key, default) or default)
+    except (TypeError, ValueError):
+        return default
 
-    Each slate dict: ``dg``, ``name``, ``lock_time`` (UTC-aware datetime),
-    ``lock_time_et``, ``contest_count``, ``csv_path`` (``Path`` or ``None``).
+
+def _contest_field_float(contest: dict[str, Any], key: str, default: float = 0.0) -> float:
+    try:
+        return float(contest.get(key, default) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _get_todays_slates() -> list[dict[str, Any]]:
+    """Fetch today's MLB Classic GPP slates from DK (one row per unique ``dg``).
+
+    Qualifying contests: Classic, MLB in name, today ET, entry fee ``a`` <= 25,
+  max field ``m`` >= 5000. Slates are grouped by ``dg``, sorted by ``max_entries``
+    descending, and draft groups with ``max_entries`` < 5000 are dropped.
+
+    Each slate dict includes ``dg``, ``name`` (largest-field contest name),
+    ``lock_time``, ``lock_time_et``, ``contest_count``, ``max_entries``,
+    ``total_current_entries``, ``max_prize_pool``, ``csv_path``.
     """
     et = pytz.timezone("America/New_York")
     today_et = datetime.now(et).date()
@@ -267,6 +286,10 @@ def _get_todays_slates() -> list[dict[str, Any]]:
         name = str(c.get("n", "") or "")
         if "MLB" not in name:
             continue
+        if _contest_field_int(c, "a", default=999) > 25:
+            continue
+        if _contest_field_int(c, "m", default=0) < 5000:
+            continue
         sd = _parse_sd_ms(str(c.get("sd", "") or ""))
         if sd is None:
             continue
@@ -278,9 +301,16 @@ def _get_todays_slates() -> list[dict[str, Any]]:
         by_dg[int(dg)].append(c)
 
     slates: list[dict[str, Any]] = []
-    for dg, group in sorted(by_dg.items()):
-        group.sort(key=lambda x: _prize_value(str(x.get("n", ""))), reverse=True)
-        label = str(group[0].get("n", "") or f"MLB Classic dg={dg}")
+    for dg, group in by_dg.items():
+        max_entries = max(_contest_field_int(row, "m") for row in group)
+        if max_entries < 5000:
+            continue
+
+        rep = max(group, key=lambda row: _contest_field_int(row, "m"))
+        representative_name = str(rep.get("n", "") or f"MLB Classic dg={dg}")
+        total_current_entries = sum(_contest_field_int(row, "nt") for row in group)
+        max_prize_pool = max(_contest_field_float(row, "po") for row in group)
+
         times: list[datetime] = []
         for row in group:
             t = _parse_sd_ms(str(row.get("sd", "") or ""))
@@ -288,19 +318,24 @@ def _get_todays_slates() -> list[dict[str, Any]]:
                 times.append(t)
         if not times:
             continue
+
         lock_time = min(times)
         lock_time_et = lock_time.astimezone(et).strftime("%I:%M %p ET")
         slate: dict[str, Any] = {
             "dg": dg,
-            "name": label,
+            "name": representative_name,
             "lock_time": lock_time,
             "lock_time_et": lock_time_et,
             "contest_count": len(group),
+            "max_entries": max_entries,
+            "total_current_entries": total_current_entries,
+            "max_prize_pool": max_prize_pool,
             "csv_path": None,
         }
         slate["csv_path"] = _download_salary_csv(dg, lock_time)
         slates.append(slate)
 
+    slates.sort(key=lambda s: int(s.get("max_entries") or 0), reverse=True)
     return slates
 
 
@@ -403,7 +438,7 @@ def job_t3hr() -> None:
         send_discord("⚠️ T-3hr: no MLB Classic slates found for today", _discord_url)
         return
 
-    main = max(slates, key=lambda s: int(s.get("contest_count") or 0))
+    main = max(slates, key=lambda s: int(s.get("max_entries") or 0))
     csv_path = main.get("csv_path")
     if not csv_path or not Path(csv_path).exists():
         send_discord(
@@ -440,7 +475,8 @@ def job_t3hr() -> None:
     tops, bar = _top_implied_totals_text(3)
     lock_str = main["lock_time"].astimezone(_ET).strftime("%I:%M %p ET")
     msg = (
-        f"⚾ **T-3hr — auto slate dg={main['dg']}** ({main['contest_count']} contests, "
+        f"⚾ **T-3hr — auto slate dg={main['dg']}** "
+        f"({main['max_entries']:,} max entries, {main['contest_count']} contests, "
         f"lock {lock_str})\n"
         f"{len(players)} players, {len(banned)} auto-banned (IL/OUT)\n"
         f"Ownership sims applied (1k). Top implied: {tops}\n"

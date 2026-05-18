@@ -489,16 +489,9 @@ class SlateInference:
         row_dict["is_high_leverage"] = 0.0
         row_dict["batting_order_multiplier"] = 1.0
 
-        # Recalculate platoon for today's matchup
-        batter_hand = (
-            str(feature_row.get("stand", "R"))
-            if "stand" in feature_row.index
-            else "R"
-        )
-        platoon_advantage = 1.0 if batter_hand != opposing_pitcher_hand else 0.0
-        same_hand = 1.0 if batter_hand == opposing_pitcher_hand else 0.0
-        row_dict["platoon_advantage"] = platoon_advantage
-        row_dict["same_hand"] = same_hand
+        # xwoba_vs_hand_30d and platoon_split_magnitude come from the cached
+        # feature row (pre-computed rolling splits vs pitcher hand at training).
+        # No runtime override needed — unlike the old binary platoon flags.
 
         return pd.DataFrame([row_dict])[feature_cols]
 
