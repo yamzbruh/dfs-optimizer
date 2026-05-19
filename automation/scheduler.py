@@ -8,7 +8,7 @@ Run::
 
     python -m automation.scheduler
 
-Requires: ``apscheduler``, ``beautifulsoup4``, ``pybaseball``, ``pytz``,
+Requires: ``apscheduler``, ``pybaseball``, ``pytz``,
 ``DISCORD_WEBHOOK_URL`` (optional).
 """
 
@@ -30,7 +30,6 @@ import pandas as pd
 import pytz
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
-from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from loguru import logger
 from zoneinfo import ZoneInfo
@@ -485,98 +484,124 @@ def job_t3hr() -> None:
     send_discord(msg, _discord_url)
 
 
-def _normalize_name_key(name: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", name.lower())
+def get_mlb_probable_pitchers() -> dict[str, str]:
+    """Fetch today's probable pitchers from MLB Stats API.
 
+    Returns dict mapping team abbreviation -> pitcher full name.
+    Example: {'MIL': 'Jacob Misiorowski', 'CHC': 'Ben Brown', ...}
 
-def scrape_baseball_press_confirmed_sps() -> dict[str, str]:
-    """Scrape Baseball Press for confirmed SP per team (abbr → name)."""
-    url = "https://www.baseballpress.com/lineups"
+    Uses GET /api/v1/schedule?sportId=1&date=today&hydrate=probablePitcher,team
+    Returns empty dict on failure — never crashes.
+    """
+    mlb_api_to_dk: dict[str, str] = {
+        "ARI": "ARI",
+        "ATL": "ATL",
+        "BAL": "BAL",
+        "BOS": "BOS",
+        "CHC": "CHC",
+        "CWS": "CWS",
+        "CIN": "CIN",
+        "CLE": "CLE",
+        "COL": "COL",
+        "DET": "DET",
+        "HOU": "HOU",
+        "KC": "KC",
+        "LAA": "LAA",
+        "LAD": "LAD",
+        "MIA": "MIA",
+        "MIL": "MIL",
+        "MIN": "MIN",
+        "NYM": "NYM",
+        "NYY": "NYY",
+        "ATH": "ATH",
+        "OAK": "ATH",
+        "PHI": "PHI",
+        "PIT": "PIT",
+        "SD": "SD",
+        "SF": "SF",
+        "SEA": "SEA",
+        "STL": "STL",
+        "TB": "TB",
+        "TEX": "TEX",
+        "TOR": "TOR",
+        "WSH": "WSH",
+        "WSN": "WSH",
+    }
+
     try:
-        r = requests.get(url, headers=_HTTP_HEADERS, timeout=25)
+        today = date.today().strftime("%Y-%m-%d")
+        r = requests.get(
+            "https://statsapi.mlb.com/api/v1/schedule",
+            params={
+                "sportId": 1,
+                "date": today,
+                "hydrate": "probablePitcher,team",
+            },
+            timeout=15,
+        )
         r.raise_for_status()
+        dates = r.json().get("dates", [])
+        games = dates[0].get("games", []) if dates else []
+
+        result: dict[str, str] = {}
+        for g in games:
+            for side in ("home", "away"):
+                team_data = g.get("teams", {}).get(side, {})
+                abbr = team_data.get("team", {}).get("abbreviation", "")
+                dk_abbr = mlb_api_to_dk.get(abbr, abbr)
+                pitcher = team_data.get("probablePitcher", {})
+                name = pitcher.get("fullName", "")
+                if dk_abbr and name:
+                    result[dk_abbr] = name
+
+        logger.info(f"MLB probable pitchers: {len(result)} teams confirmed")
+        return result
+
     except Exception as exc:  # noqa: BLE001
-        logger.warning(f"Baseball Press fetch failed: {exc}")
+        logger.warning(f"get_mlb_probable_pitchers failed: {exc}")
         return {}
 
-    soup = BeautifulSoup(r.text, "html.parser")
-    out: dict[str, str] = {}
 
-    for div in soup.select("div.lineup"):
-        team_el = div.select_one("[data-team]")
-        abbr = ""
-        if team_el and team_el.has_attr("data-team"):
-            abbr = str(team_el["data-team"]).strip().upper()
-        if not abbr:
-            hdr = div.find(["h2", "h3", "h4"])
-            if hdr:
-                m = re.search(r"\b([A-Z]{2,4})\b", hdr.get_text(" ", strip=True))
-                if m:
-                    abbr = m.group(1)
-        if not abbr:
-            continue
-        pitch_link = None
-        for a in div.select('a[href*="/players/"]'):
-            t = a.get_text(" ", strip=True)
-            if t and "pitcher" not in t.lower():
-                pitch_link = t
-                break
-        if pitch_link:
-            out[abbr] = pitch_link
-
-    if out:
-        return out
-
-    for table in soup.find_all("table"):
-        for tr in table.find_all("tr"):
-            tds = tr.find_all("td")
-            if len(tds) < 2:
-                continue
-            team_txt = tds[0].get_text(" ", strip=True)
-            m = re.search(r"\b([A-Z]{2,4})\b", team_txt)
-            if not m:
-                continue
-            abbr = m.group(1)
-            link = tds[1].find("a")
-            name = (
-                link.get_text(" ", strip=True) if link else tds[1].get_text(" ", strip=True)
-            )
-            if name:
-                out[abbr] = name
-    return out
-
-
-def _sp_mismatch_flags(
-    players: list[DKPlayer], confirmed: dict[str, str]
+def _check_sp_confirmation(
+    dk_players: list[DKPlayer],
+    probable_pitchers: dict[str, str],
 ) -> tuple[list[str], list[str]]:
-    """Return (confirmed_lines, unconfirmed_lines) for DK SPs."""
-    confirmed_lines: list[str] = []
-    unconfirmed_lines: list[str] = []
+    """Compare DK SP pool against MLB probable pitchers.
+
+    Returns:
+        confirmed: list of "Name (TEAM)" strings for confirmed starters
+        unconfirmed: list of "Name (TEAM)" strings for unconfirmed/mismatched
+    """
+    from rapidfuzz import fuzz
 
     dk_sps = [
         p
-        for p in players
-        if p.is_pitcher and (p.dk_position or "").upper().startswith("SP")
+        for p in dk_players
+        if p.is_pitcher and (p.dk_position or "").upper() == "SP"
     ]
+
+    confirmed: list[str] = []
+    unconfirmed: list[str] = []
+
     for p in dk_sps:
         team = (p.team or "").strip().upper()
-        bp_name = confirmed.get(team)
-        if not bp_name:
-            unconfirmed_lines.append(f"{p.name} ({team}) — no Baseball Press row")
+        probable_name = probable_pitchers.get(team, "")
+
+        if not probable_name:
+            unconfirmed.append(f"{p.name} ({team}) — no probable listed")
             continue
-        if _normalize_name_key(p.name) in _normalize_name_key(bp_name):
-            confirmed_lines.append(f"{p.name} ({team}) ↔ BP {bp_name}")
-        elif _normalize_name_key(bp_name) in _normalize_name_key(p.name):
-            confirmed_lines.append(f"{p.name} ({team}) ↔ BP {bp_name}")
+
+        score = fuzz.token_sort_ratio(p.name.lower(), probable_name.lower())
+        if score >= 80:
+            confirmed.append(f"{p.name} ({team})")
         else:
-            unconfirmed_lines.append(
-                f"{p.name} ({team}) ⚠ BP lists **{bp_name}**"
-            )
-    return confirmed_lines, unconfirmed_lines
+            unconfirmed.append(f"{p.name} ({team}) — probable is {probable_name}")
+
+    return confirmed, unconfirmed
 
 
 def job_t2hr() -> None:
-    """T-2hr: Baseball Press SP check, ownership sims, preliminary lineups."""
+    """T-2hr: MLB probable SP check, ownership sims, preliminary lineups."""
     global _current_projections, _current_lineups, _t2_banned_snapshot, _t2_bp_sp_signature
 
     if (
@@ -592,9 +617,9 @@ def job_t2hr() -> None:
         send_discord("⚠️ T-2hr: no players in memory — run T-3hr first", _discord_url)
         return
 
-    bp = scrape_baseball_press_confirmed_sps()
-    _t2_bp_sp_signature = json.dumps(sorted(bp.items()), sort_keys=True)
-    ok_sp, bad_sp = _sp_mismatch_flags(_current_players, bp)
+    probable = get_mlb_probable_pitchers()
+    _t2_bp_sp_signature = json.dumps(sorted(probable.items()), sort_keys=True)
+    ok_sp, bad_sp = _check_sp_confirmation(_current_players, probable)
 
     tids = team_ids_from_dk_players(_current_players)
     _status_checker.reset_cache()
@@ -653,7 +678,7 @@ def job_t2hr() -> None:
 
 
 def job_t1hr() -> None:
-    """T-1hr: Re-check rosters + Baseball Press; regenerate if needed."""
+    """T-1hr: Re-check rosters + MLB probable pitchers; regenerate if needed."""
     global _current_projections, _current_lineups
 
     if _slate_inference is None or _status_checker is None or _lineup_optimizer is None:
@@ -672,10 +697,10 @@ def job_t1hr() -> None:
     )
     banned_f = frozenset(banned)
 
-    bp = scrape_baseball_press_confirmed_sps()
-    bp_sig = json.dumps(sorted(bp.items()), sort_keys=True)
+    probable = get_mlb_probable_pitchers()
+    probable_sig = json.dumps(sorted(probable.items()), sort_keys=True)
 
-    changed = banned_f != _t2_banned_snapshot or bp_sig != _t2_bp_sp_signature
+    changed = banned_f != _t2_banned_snapshot or probable_sig != _t2_bp_sp_signature
 
     if changed:
         new_bans = sorted(banned_f - _t2_banned_snapshot)
@@ -699,7 +724,7 @@ def job_t1hr() -> None:
         _current_lineups = lineups
         send_discord(
             "🚨 **LINEUP CHANGE**"
-            f"{name_hint} — bans or Baseball Press differ from T-2hr snapshot; "
+            f"{name_hint} — bans or probable pitchers differ from T-2hr snapshot; "
             "**projections + lineups regenerated**",
             _discord_url,
         )

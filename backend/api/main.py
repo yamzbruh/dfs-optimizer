@@ -555,8 +555,21 @@ async def generate_projections() -> list[ProjectionResponse]:
         if _slate_inference is not None:
             logger.info("Using SlateInference for real model projections")
             _slate_inference.load_vegas()
+            from automation.scheduler import get_mlb_probable_pitchers
+
+            try:
+                probable_pitchers = get_mlb_probable_pitchers()
+                logger.info(
+                    f"Probable pitchers loaded: {len(probable_pitchers)} teams"
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"Failed to load probable pitchers: {exc}")
+                probable_pitchers = {}
+
             projections = _slate_inference.build_projections(
-                _current_players, use_models=True
+                _current_players,
+                use_models=True,
+                probable_pitchers=probable_pitchers,
             )
         else:
             logger.warning("SlateInference not available — using DK avg fallback")

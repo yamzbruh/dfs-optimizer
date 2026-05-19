@@ -696,6 +696,7 @@ class SlateInference:
         self,
         players: list[DKPlayer],
         use_models: bool = True,
+        probable_pitchers: dict[str, str] | None = None,
     ) -> list[PlayerProjection]:
         """Build PlayerProjection list for all slate players.
 
@@ -710,6 +711,8 @@ class SlateInference:
             players: Full DK player pool from parsed CSV.
             use_models: If False, use DK avg fallback for all
                 players (fast, for testing).
+            probable_pitchers: Optional team abbr → probable SP name from
+                MLB Stats API. Unconfirmed SPs (fuzzy score < 80) get zeroed.
 
         Returns:
             List of PlayerProjection with model-based quantiles.
@@ -727,6 +730,37 @@ class SlateInference:
         fallback_used = 0
 
         for player in players:
+            if (
+                player.is_pitcher
+                and (player.dk_position or "").upper() == "SP"
+                and probable_pitchers
+            ):
+                from rapidfuzz import fuzz
+
+                team = (player.team or "").strip().upper()
+                probable_name = probable_pitchers.get(team, "")
+                if probable_name:
+                    score = fuzz.token_sort_ratio(
+                        player.name.lower(), probable_name.lower()
+                    )
+                    if score < 80:
+                        logger.debug(
+                            f"SP not confirmed: {player.name} ({team}) — "
+                            f"probable is {probable_name} (score={score:.0f})"
+                        )
+                        projections.append(
+                            PlayerProjection(
+                                player=player,
+                                pts_q15=0.0,
+                                pts_q50=0.0,
+                                pts_q85=0.0,
+                                ownership_proj=0.0,
+                                leverage_score=0.0,
+                            )
+                        )
+                        fallback_used += 1
+                        continue
+
             mlbam_id: int | None = None
             q15, q50, q85 = self._fallback_projection(player)
             used_model = False

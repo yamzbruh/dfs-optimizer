@@ -74,6 +74,7 @@ class LineupStatusChecker:
         self._status_loaded = False
         self._status_reasons: dict[int, str] = {}
         self._cache_key: str | None = None
+        self._roster_name_to_mlbam: dict[str, int] = {}
 
     def reset_cache(self) -> None:
         """Clear session cache (e.g. new slate upload)."""
@@ -82,6 +83,7 @@ class LineupStatusChecker:
         self._status_reasons.clear()
         self._status_loaded = False
         self._cache_key = None
+        self._roster_name_to_mlbam = {}
 
     def _fetch_roster(self, team_id: int, season: int) -> list[dict[str, Any]]:
         url = f"{_STATSAPI}/teams/{team_id}/roster"
@@ -127,6 +129,9 @@ class LineupStatusChecker:
         if pid is None:
             return
         mlbam = int(pid)
+        full_name = str(person.get("fullName", "") or "").strip()
+        if full_name:
+            self._roster_name_to_mlbam[full_name.lower()] = mlbam
         st = entry.get("status") or {}
         code = _status_code(st)
         desc = ""
@@ -156,6 +161,7 @@ class LineupStatusChecker:
         self._unavailable_mlbam.clear()
         self._dtd_mlbam.clear()
         self._status_reasons.clear()
+        self._roster_name_to_mlbam.clear()
         self._cache_key = key
         self._status_loaded = True
 
@@ -187,6 +193,16 @@ class LineupStatusChecker:
             self._unavailable_mlbam.clear()
             self._dtd_mlbam.clear()
             self._status_reasons.clear()
+            self._roster_name_to_mlbam.clear()
+
+    def _match_dk_player_by_roster_name(self, player: DKPlayer) -> int | None:
+        """Match DK player name to MLBAM ID using roster API name lookup.
+
+        Exact full-name match only. More reliable than Statcast/Chadwick for
+        injured players who have no recent game data.
+        """
+        dk_name = player.name.strip().lower()
+        return self._roster_name_to_mlbam.get(dk_name)
 
     def get_unavailable_mlbam_ids(self) -> set[int]:
         return set(self._unavailable_mlbam)
@@ -202,7 +218,9 @@ class LineupStatusChecker:
         """Map unavailable MLBAM ids to DK ``dk_id`` strings."""
         out: set[str] = set()
         for p in dk_players:
-            mid = match_player(p)
+            mid = self._match_dk_player_by_roster_name(p)
+            if mid is None:
+                mid = match_player(p)
             if mid is None:
                 continue
             if mid in self._unavailable_mlbam:
@@ -216,7 +234,9 @@ class LineupStatusChecker:
     ) -> list[dict[str, str]]:
         rows: list[dict[str, str]] = []
         for p in dk_players:
-            mid = match_player(p)
+            mid = self._match_dk_player_by_roster_name(p)
+            if mid is None:
+                mid = match_player(p)
             if mid is None:
                 continue
             reason = self._status_reasons.get(mid, "")
