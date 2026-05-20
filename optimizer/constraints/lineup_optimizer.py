@@ -132,6 +132,44 @@ def _game_key(player: DKPlayer) -> str:
     return player.game_info_raw or "unknown"
 
 
+def _opposing_team(player: DKPlayer) -> str | None:
+    """Opponent abbreviation for this player's game (DK ``home_team`` / ``away_team``)."""
+    team = (player.team or "").strip().upper()
+    home = (player.home_team or "").strip().upper()
+    away = (player.away_team or "").strip().upper()
+    if not team or not home or not away:
+        return None
+    if team == home:
+        return away
+    if team == away:
+        return home
+    return None
+
+
+def _log_anti_stack_summary(projections: list[PlayerProjection]) -> None:
+    """Log anti-stack pool stats once before a batch of ILP solves."""
+    n = len(projections)
+    n_pitchers = 0
+    n_opp_groups = 0
+    for pi in range(n):
+        if not projections[pi].player.is_pitcher:
+            continue
+        opp = _opposing_team(projections[pi].player)
+        if not opp:
+            continue
+        n_pitchers += 1
+        has_opp_hitters = any(
+            not projections[hj].player.is_pitcher
+            and (projections[hj].player.team or "").strip().upper() == opp
+            for hj in range(n)
+        )
+        if has_opp_hitters:
+            n_opp_groups += 1
+    logger.debug(
+        f"Anti-stack: {n_pitchers} pitchers, {n_opp_groups} opposing hitter groups"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Optimizer
 # ---------------------------------------------------------------------------
@@ -318,6 +356,26 @@ class LineupOptimizer:
                 prob += (
                     pulp.lpSum(x[i] for i in hitter_idx) <= 5,
                     f"max_hitters_{team}",
+                )
+
+        # -- Anti-stack: no hitter from a pitcher's opposing team ------------
+        for pi in range(n):
+            if not projections[pi].player.is_pitcher:
+                continue
+            opp = _opposing_team(projections[pi].player)
+            if not opp:
+                continue
+            opp_hitter_vars = [
+                x[hj]
+                for hj in range(n)
+                if not projections[hj].player.is_pitcher
+                and (projections[hj].player.team or "").strip().upper() == opp
+            ]
+            if opp_hitter_vars:
+                m = len(opp_hitter_vars)
+                prob += (
+                    pulp.lpSum(opp_hitter_vars) <= m * (1 - x[pi]),
+                    f"anti_stack_{pi}",
                 )
 
         # -- Locked players --------------------------------------------------
@@ -543,6 +601,8 @@ class LineupOptimizer:
 
         results: list[LineupResult] = list(seed_previous) if seed_previous else []
         prev_len = len(results)
+
+        _log_anti_stack_summary(projections)
 
         for attempt in range(1, n_lineups + 1):
             result = self.optimize_single(
@@ -790,6 +850,8 @@ class LineupOptimizer:
 
         try:
             from joblib import Parallel, delayed
+
+            _log_anti_stack_summary(projections)
 
             logger.info(
                 f"Monte Carlo: {n_simulations} simulations, "
