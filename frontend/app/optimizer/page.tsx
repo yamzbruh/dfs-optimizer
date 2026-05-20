@@ -47,15 +47,20 @@ export default function OptimizerPage() {
     lineupStatus?.report.filter((r) => r.status === "unavailable") ?? [];
   const dtdRows = lineupStatus?.report.filter((r) => r.status === "dtd") ?? [];
 
+  const autoBannedSet = new Set(lineupStatus?.auto_banned_ids ?? []);
+
   const leveragePlays = [...playerPool]
-    .filter((p) => !p.is_pitcher)
+    .filter((p) => !p.is_pitcher && !autoBannedSet.has(p.dk_id))
     .sort((a, b) => b.leverage - a.leverage)
     .slice(0, 10);
 
-  const popoffs = [...playerPool].sort(
-    (a, b) =>
-      b.proj_pts_q85 - b.proj_pts - (a.proj_pts_q85 - a.proj_pts)
-  ).slice(0, 8);
+  const popoffs = [...playerPool]
+    .filter((p) => !autoBannedSet.has(p.dk_id))
+    .sort(
+      (a, b) =>
+        b.proj_pts_q85 - b.proj_pts - (a.proj_pts_q85 - a.proj_pts)
+    )
+    .slice(0, 8);
 
   async function handleOwnership() {
     setOwnershipNotice(null);

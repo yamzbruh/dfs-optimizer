@@ -8,6 +8,7 @@ import CountdownTimer from "./CountdownTimer";
 const LINKS = [
   { href: "/slate", label: "SLATE" },
   { href: "/optimizer", label: "OPTIMIZER" },
+  { href: "/projections", label: "PROJECTIONS" },
   { href: "/lineups", label: "LINEUPS" },
   { href: "/model", label: "MODEL" },
 ];
