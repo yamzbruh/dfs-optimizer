@@ -586,6 +586,11 @@ async def generate_projections() -> list[ProjectionResponse]:
                     _current_players,
                     _slate_inference.match_dk_player_to_mlbam,
                 )
+                scratched_ids = _status_checker.get_scratched_dk_ids(
+                    _current_players,
+                    _slate_inference.match_dk_player_to_mlbam,
+                )
+                _auto_banned_ids = _auto_banned_ids | scratched_ids
                 _lineup_status_report = _status_checker.get_status_report(
                     _current_players,
                     _slate_inference.match_dk_player_to_mlbam,

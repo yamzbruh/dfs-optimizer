@@ -227,6 +227,57 @@ class LineupStatusChecker:
                 out.add(p.dk_id)
         return out
 
+    def get_scratched_dk_ids(
+        self,
+        dk_players: list[DKPlayer],
+        match_player: Callable[[DKPlayer], int | None],
+    ) -> set[str]:
+        """DK ids for hitters not in Rotowire's confirmed lineup (per team).
+
+        Uses :func:`rotowire_lineups.get_confirmed_lineups` with fuzzy name
+        matching (``token_sort_ratio`` >= 80). Only teams with at least 8
+        confirmed batters are evaluated. Pitchers are excluded.
+        """
+        del match_player  # name-based; signature kept for API parity
+
+        try:
+            from data_pipeline.ingestion.rotowire_lineups import (
+                get_confirmed_lineups,
+            )
+            from rapidfuzz import fuzz
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"get_scratched_dk_ids import failed: {exc}")
+            return set()
+
+        confirmed_by_team = get_confirmed_lineups()
+        if not confirmed_by_team:
+            return set()
+
+        min_lineup = 8
+        scratched: set[str] = set()
+
+        for p in dk_players:
+            if p.is_pitcher:
+                continue
+            team = (p.team or "").strip().upper()
+            lineup_names = confirmed_by_team.get(team)
+            if not lineup_names or len(lineup_names) < min_lineup:
+                continue
+
+            dk_name = p.name.strip().lower()
+            best = max(
+                fuzz.token_sort_ratio(dk_name, n.lower()) for n in lineup_names
+            )
+            if best < 80:
+                scratched.add(p.dk_id)
+
+        if scratched:
+            logger.info(
+                f"Rotowire scratched: {len(scratched)} DK hitters "
+                f"not in confirmed lineups"
+            )
+        return scratched
+
     def get_status_report(
         self,
         dk_players: list[DKPlayer],

@@ -219,6 +219,28 @@ def _report_auto_bans(
     return checker
 
 
+def _report_rotowire_scratched(
+    players: list[DKPlayer],
+    checker: LineupStatusChecker,
+    inference: SlateInference,
+) -> None:
+    _section("2b. ROTOWIRE SCRATCHED (not in confirmed lineup)")
+    match = inference.match_dk_player_to_mlbam
+    scratched_ids = checker.get_scratched_dk_ids(players, match)
+    scratched_players = [p for p in players if p.dk_id in scratched_ids]
+    scratched_players.sort(key=lambda p: (p.team, p.name))
+
+    print(f"Scratched hitters: {len(scratched_ids)}")
+    if not scratched_players:
+        print("No Rotowire scratches (or lineups not fully posted).")
+        return
+
+    print(f"{'Name':<26} {'Team':<5} {'Pos':<5}")
+    print("-" * 40)
+    for p in scratched_players:
+        print(f"{p.name:<26} {p.team:<5} {(p.dk_position or '?'):<5}")
+
+
 def _report_sp_confirmation(players: list[DKPlayer]) -> None:
     _section("3. SP CONFIRMATION STATUS (MLB Stats API)")
     probable_map = get_mlb_probable_pitchers()
@@ -395,7 +417,8 @@ def main() -> None:
     inference.load_feature_matrices()
     inference.load_vegas()
 
-    _report_auto_bans(players, inference)
+    checker = _report_auto_bans(players, inference)
+    _report_rotowire_scratched(players, checker, inference)
     _report_sp_confirmation(players)
 
     print("\nBuilding projections (models + Vegas + probable SP filter)...")
