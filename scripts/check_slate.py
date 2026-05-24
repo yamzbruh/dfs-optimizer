@@ -33,6 +33,10 @@ from data_pipeline.ingestion.lineup_status import (
     team_ids_from_dk_players,
 )
 from data_pipeline.ingestion.odds_ingestion import OddsIngestion
+from data_pipeline.ingestion.rotowire_lineups import (
+    get_confirmed_lineups,
+    get_confirmed_starters,
+)
 from data_pipeline.loaders.parquet_cache import ParquetCache
 from ml.features.ownership_projector import OwnershipProjector
 from ml.inference.slate_inference import SlateInference
@@ -423,8 +427,6 @@ def main() -> None:
 
     print("\nBuilding projections (models + Vegas + probable SP filter)...")
     probable_pitchers = get_mlb_probable_pitchers()
-    from data_pipeline.ingestion.rotowire_lineups import get_confirmed_starters
-
     rotowire_starters = get_confirmed_starters()
     projections = inference.build_projections(
         players,
@@ -432,6 +434,13 @@ def main() -> None:
         probable_pitchers=probable_pitchers,
         rotowire_starters=rotowire_starters,
     )
+
+    match = inference.match_dk_player_to_mlbam
+    banned_ids = checker.get_unavailable_dk_ids(players, match)
+    scratched_ids = checker.get_scratched_dk_ids(players, match)
+    all_banned = banned_ids | scratched_ids
+    projections = [p for p in projections if p.player.dk_id not in all_banned]
+
     _report_projections(players, projections)
     _report_ownership(projections)
     _report_freshness(vegas_df)

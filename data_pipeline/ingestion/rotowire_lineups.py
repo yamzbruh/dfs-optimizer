@@ -7,6 +7,7 @@ Results are cached in-process for 10 minutes.
 from __future__ import annotations
 
 import time
+from typing import Any
 
 import requests
 from bs4 import BeautifulSoup
@@ -37,6 +38,17 @@ def _class_has(classes: list[str] | str | None, token: str) -> bool:
     if isinstance(classes, str):
         return token in classes.split()
     return token in classes
+
+
+def _sp_name_from_link(sp_link: Any) -> str:
+    """Full SP name from Rotowire link; expand abbreviated text via URL slug."""
+    href = sp_link.get("href", "") or ""
+    if href and "/baseball/player/" in href:
+        slug = href.split("/baseball/player/")[-1].split("?")[0].strip("/")
+        slug = slug.rsplit("-", 1)[0]
+        if slug:
+            return " ".join(word.capitalize() for word in slug.split("-"))
+    return sp_link.get_text(strip=True)
 
 
 def _scrape_rotowire() -> tuple[dict[str, list[str]], dict[str, str]]:
@@ -101,7 +113,7 @@ def _scrape_rotowire() -> tuple[dict[str, list[str]], dict[str, str]]:
                 if sp_li:
                     sp_link = sp_li.find("a")
                     if sp_link:
-                        sp_name = sp_link.get_text(strip=True)
+                        sp_name = _sp_name_from_link(sp_link)
 
                 players: list[str] = []
                 for li in ul.find_all(
