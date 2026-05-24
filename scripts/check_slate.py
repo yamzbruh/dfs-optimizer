@@ -423,10 +423,14 @@ def main() -> None:
 
     print("\nBuilding projections (models + Vegas + probable SP filter)...")
     probable_pitchers = get_mlb_probable_pitchers()
+    from data_pipeline.ingestion.rotowire_lineups import get_confirmed_starters
+
+    rotowire_starters = get_confirmed_starters()
     projections = inference.build_projections(
         players,
         use_models=True,
         probable_pitchers=probable_pitchers,
+        rotowire_starters=rotowire_starters,
     )
     _report_projections(players, projections)
     _report_ownership(projections)

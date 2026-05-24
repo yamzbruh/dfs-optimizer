@@ -495,10 +495,30 @@ class SlateInference:
 
         return pd.DataFrame([row_dict])[feature_cols]
 
+    def _is_confirmed_starter(
+        self,
+        player: DKPlayer,
+        rotowire_starters: dict[str, str],
+    ) -> bool:
+        if not rotowire_starters:
+            return (player.dk_position or "").upper() == "SP"
+        team = (player.team or "").strip().upper()
+        confirmed_sp = rotowire_starters.get(team, "")
+        if confirmed_sp:
+            score = fuzz.token_sort_ratio(player.name.lower(), confirmed_sp.lower())
+            logger.debug(
+                f"_is_confirmed_starter: {player.name} ({team}) vs Rotowire "
+                f"'{confirmed_sp}' score={score} is_starter={score >= 80}"
+            )
+            if score >= 80:
+                return True
+        return (player.dk_position or "").upper() == "SP"
+
     def _build_pitcher_feature_vector(
         self,
         feature_row: pd.Series,
         player: DKPlayer,
+        rotowire_starters: dict[str, str] | None = None,
     ) -> pd.DataFrame:
         """Build a single-row feature DataFrame for pitcher inference.
 
@@ -519,22 +539,24 @@ class SlateInference:
             else:
                 row_dict[col] = 0.0
 
-        # Override is_starter from dk_position at inference time.
-        # Historical feature rows may reflect a different role (e.g. a reliever
-        # who was a starter earlier). dk_position is the ground truth for today.
+        # Override is_starter from Rotowire confirmed SP or dk_position.
+        rw = rotowire_starters or {}
+        is_starter = self._is_confirmed_starter(player, rw)
         if "is_starter" in feature_cols:
-            row_dict["is_starter"] = (
-                1.0 if (player.dk_position or "").upper() == "SP" else 0.0
-            )
+            row_dict["is_starter"] = 1.0 if is_starter else 0.0
 
-        if (player.dk_position or "").upper() != "SP":
+        if not is_starter:
             for ip_col in ("ip_per_start_7d", "ip_per_start_14d", "ip_per_start_30d"):
                 if ip_col in feature_cols and float(row_dict.get(ip_col, 0) or 0) > 2.0:
                     row_dict[ip_col] = 1.0  # typical reliever outing
 
         return pd.DataFrame([row_dict])[feature_cols]
 
-    def _fallback_projection(self, player: DKPlayer) -> tuple[float, float, float]:
+    def _fallback_projection(
+        self,
+        player: DKPlayer,
+        rotowire_starters: dict[str, str] | None = None,
+    ) -> tuple[float, float, float]:
         """Fallback q15/q50/q85 from DK avg when model can't run.
 
         Uses DK avg_points_per_game with conservative multipliers.
@@ -543,8 +565,7 @@ class SlateInference:
         avg = float(player.avg_points_per_game)
 
         if player.is_pitcher:
-            # Check if reliever — cap at 15 pts
-            is_starter = (player.dk_position or "").upper() == "SP"
+            is_starter = self._is_confirmed_starter(player, rotowire_starters or {})
             if not is_starter:
                 avg = min(avg, 15.0)
             q50 = avg
@@ -697,6 +718,7 @@ class SlateInference:
         players: list[DKPlayer],
         use_models: bool = True,
         probable_pitchers: dict[str, str] | None = None,
+        rotowire_starters: dict[str, str] | None = None,
     ) -> list[PlayerProjection]:
         """Build PlayerProjection list for all slate players.
 
@@ -713,6 +735,8 @@ class SlateInference:
                 players (fast, for testing).
             probable_pitchers: Optional team abbr → probable SP name from
                 MLB Stats API. Unconfirmed SPs (fuzzy score < 80) get zeroed.
+            rotowire_starters: Optional team abbr → confirmed SP name from
+                Rotowire; used for starter vs reliever model routing.
 
         Returns:
             List of PlayerProjection with model-based quantiles.
@@ -723,11 +747,17 @@ class SlateInference:
         if not self._vegas_implied:
             self.load_vegas()
 
+        logger.info(
+            f"build_projections: rotowire_starters="
+            f"{len(rotowire_starters) if rotowire_starters else 0} teams"
+        )
+
         projections = []
         matched = 0
         unmatched = 0
         model_used = 0
         fallback_used = 0
+        rw_starters = rotowire_starters or {}
 
         for player in players:
             if (
@@ -762,7 +792,7 @@ class SlateInference:
                         continue
 
             mlbam_id: int | None = None
-            q15, q50, q85 = self._fallback_projection(player)
+            q15, q50, q85 = self._fallback_projection(player, rw_starters)
             used_model = False
 
             if use_models and self._name_to_mlbam:
@@ -775,10 +805,10 @@ class SlateInference:
                             feat_row = self._get_latest_pitcher_features(mlbam_id)
                             if feat_row is not None:
                                 preds = None
-                                is_sp = (player.dk_position or "").upper() == "SP"
+                                is_sp = self._is_confirmed_starter(player, rw_starters)
                                 if is_sp and self._starter_model is not None:
                                     feat_df = self._build_pitcher_feature_vector(
-                                        feat_row, player
+                                        feat_row, player, rw_starters
                                     )
                                     preds = self._starter_model.predict(feat_df)
                                 elif (
@@ -786,12 +816,12 @@ class SlateInference:
                                     and self._reliever_model is not None
                                 ):
                                     feat_df = self._build_pitcher_feature_vector(
-                                        feat_row, player
+                                        feat_row, player, rw_starters
                                     )
                                     preds = self._reliever_model.predict(feat_df)
                                 elif self._pitcher_model is not None:
                                     feat_df = self._build_pitcher_feature_vector(
-                                        feat_row, player
+                                        feat_row, player, rw_starters
                                     )
                                     preds = self._pitcher_model.predict(feat_df)
                                 if preds is not None:
@@ -826,7 +856,7 @@ class SlateInference:
                         f"DK avg={player.avg_points_per_game:.1f} "
                         f"— reverting to fallback"
                     )
-                    q15, q50, q85 = self._fallback_projection(player)
+                    q15, q50, q85 = self._fallback_projection(player, rw_starters)
                     used_model = False
 
             if mlbam_id is not None and not player.is_pitcher:

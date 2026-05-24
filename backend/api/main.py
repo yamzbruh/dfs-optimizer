@@ -566,10 +566,22 @@ async def generate_projections() -> list[ProjectionResponse]:
                 logger.warning(f"Failed to load probable pitchers: {exc}")
                 probable_pitchers = {}
 
+            from data_pipeline.ingestion.rotowire_lineups import get_confirmed_starters
+
+            try:
+                rotowire_starters = get_confirmed_starters()
+                logger.info(
+                    f"Rotowire starters loaded: {len(rotowire_starters)} teams"
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"Rotowire starters failed: {exc}")
+                rotowire_starters = {}
+
             projections = _slate_inference.build_projections(
                 _current_players,
                 use_models=True,
                 probable_pitchers=probable_pitchers,
+                rotowire_starters=rotowire_starters,
             )
         else:
             logger.warning("SlateInference not available — using DK avg fallback")
