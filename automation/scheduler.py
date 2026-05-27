@@ -45,6 +45,7 @@ from data_pipeline.ingestion.lineup_status import (
     team_ids_from_dk_players,
 )
 from data_pipeline.ingestion.odds_ingestion import OddsIngestion
+from data_pipeline.ingestion.probable_pitchers import get_confirmed_sps
 from data_pipeline.loaders.parquet_cache import ParquetCache
 from ml.features.ownership_projector import OwnershipProjector
 from ml.inference.slate_inference import SlateInference
@@ -484,89 +485,11 @@ def job_t3hr() -> None:
     send_discord(msg, _discord_url)
 
 
-def get_mlb_probable_pitchers() -> dict[str, str]:
-    """Fetch today's probable pitchers from MLB Stats API.
-
-    Returns dict mapping team abbreviation -> pitcher full name.
-    Example: {'MIL': 'Jacob Misiorowski', 'CHC': 'Ben Brown', ...}
-
-    Uses GET /api/v1/schedule?sportId=1&date=today&hydrate=probablePitcher,team
-    Returns empty dict on failure — never crashes.
-    """
-    mlb_api_to_dk: dict[str, str] = {
-        "ARI": "ARI",
-        "ATL": "ATL",
-        "BAL": "BAL",
-        "BOS": "BOS",
-        "CHC": "CHC",
-        "CWS": "CWS",
-        "CIN": "CIN",
-        "CLE": "CLE",
-        "COL": "COL",
-        "DET": "DET",
-        "HOU": "HOU",
-        "KC": "KC",
-        "LAA": "LAA",
-        "LAD": "LAD",
-        "MIA": "MIA",
-        "MIL": "MIL",
-        "MIN": "MIN",
-        "NYM": "NYM",
-        "NYY": "NYY",
-        "ATH": "ATH",
-        "OAK": "ATH",
-        "PHI": "PHI",
-        "PIT": "PIT",
-        "SD": "SD",
-        "SF": "SF",
-        "SEA": "SEA",
-        "STL": "STL",
-        "TB": "TB",
-        "TEX": "TEX",
-        "TOR": "TOR",
-        "WSH": "WSH",
-        "WSN": "WSH",
-    }
-
-    try:
-        today = date.today().strftime("%Y-%m-%d")
-        r = requests.get(
-            "https://statsapi.mlb.com/api/v1/schedule",
-            params={
-                "sportId": 1,
-                "date": today,
-                "hydrate": "probablePitcher,team",
-            },
-            timeout=15,
-        )
-        r.raise_for_status()
-        dates = r.json().get("dates", [])
-        games = dates[0].get("games", []) if dates else []
-
-        result: dict[str, str] = {}
-        for g in games:
-            for side in ("home", "away"):
-                team_data = g.get("teams", {}).get(side, {})
-                abbr = team_data.get("team", {}).get("abbreviation", "")
-                dk_abbr = mlb_api_to_dk.get(abbr, abbr)
-                pitcher = team_data.get("probablePitcher", {})
-                name = pitcher.get("fullName", "")
-                if dk_abbr and name:
-                    result[dk_abbr] = name
-
-        logger.info(f"MLB probable pitchers: {len(result)} teams confirmed")
-        return result
-
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(f"get_mlb_probable_pitchers failed: {exc}")
-        return {}
-
-
 def _check_sp_confirmation(
     dk_players: list[DKPlayer],
-    probable_pitchers: dict[str, str],
+    confirmed_sps: dict[str, str],
 ) -> tuple[list[str], list[str]]:
-    """Compare DK SP pool against MLB probable pitchers.
+    """Compare DK SP pool against confirmed SPs (MLB + Rotowire fill).
 
     Returns:
         confirmed: list of "Name (TEAM)" strings for confirmed starters
@@ -585,7 +508,7 @@ def _check_sp_confirmation(
 
     for p in dk_sps:
         team = (p.team or "").strip().upper()
-        probable_name = probable_pitchers.get(team, "")
+        probable_name = confirmed_sps.get(team, "")
 
         if not probable_name:
             unconfirmed.append(f"{p.name} ({team}) — no probable listed")
@@ -617,9 +540,9 @@ def job_t2hr() -> None:
         send_discord("⚠️ T-2hr: no players in memory — run T-3hr first", _discord_url)
         return
 
-    probable = get_mlb_probable_pitchers()
-    _t2_bp_sp_signature = json.dumps(sorted(probable.items()), sort_keys=True)
-    ok_sp, bad_sp = _check_sp_confirmation(_current_players, probable)
+    confirmed_sps = get_confirmed_sps()
+    _t2_bp_sp_signature = json.dumps(sorted(confirmed_sps.items()), sort_keys=True)
+    ok_sp, bad_sp = _check_sp_confirmation(_current_players, confirmed_sps)
 
     tids = team_ids_from_dk_players(_current_players)
     _status_checker.reset_cache()
@@ -697,8 +620,8 @@ def job_t1hr() -> None:
     )
     banned_f = frozenset(banned)
 
-    probable = get_mlb_probable_pitchers()
-    probable_sig = json.dumps(sorted(probable.items()), sort_keys=True)
+    confirmed_sps = get_confirmed_sps()
+    probable_sig = json.dumps(sorted(confirmed_sps.items()), sort_keys=True)
 
     changed = banned_f != _t2_banned_snapshot or probable_sig != _t2_bp_sp_signature
 

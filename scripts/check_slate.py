@@ -23,10 +23,7 @@ logger.add(sys.stderr, level="ERROR")
 
 import pandas as pd
 
-from automation.scheduler import (  # noqa: E402
-    _check_sp_confirmation,
-    get_mlb_probable_pitchers,
-)
+from rapidfuzz import fuzz  # noqa: E402
 from data_pipeline.ingestion.dk_csv_parser import DKCSVParser, DKPlayer
 from data_pipeline.ingestion.lineup_status import (
     LineupStatusChecker,
@@ -246,16 +243,40 @@ def _report_rotowire_scratched(
 
 
 def _report_sp_confirmation(players: list[DKPlayer]) -> None:
-    _section("3. SP CONFIRMATION STATUS (MLB Stats API)")
-    probable_map = get_mlb_probable_pitchers()
-    ok_lines, bad_lines = _check_sp_confirmation(players, probable_map)
+    _section("3. SP CONFIRMATION STATUS (MLB + Rotowire)")
+    from data_pipeline.ingestion.probable_pitchers import get_confirmed_sps, get_mlb_probable_pitchers
+    from data_pipeline.ingestion.rotowire_lineups import get_confirmed_starters
+
+    mlb_probables = get_mlb_probable_pitchers()
+    rotowire_starters = get_confirmed_starters()
+    confirmed_sps = get_confirmed_sps()
 
     dk_sps = [
         p
         for p in players
         if p.is_pitcher and (p.dk_position or "").upper() == "SP"
     ]
-    print(f"MLB probable pitchers listed: {len(probable_map)}")
+
+    confirmed: list[str] = []
+    unconfirmed: list[str] = []
+
+    for p in dk_sps:
+        team = (p.team or "").strip().upper()
+        sp_name = confirmed_sps.get(team, "")
+        if not sp_name:
+            unconfirmed.append(f"{p.name} ({team}) — no SP listed")
+            continue
+        score = fuzz.token_sort_ratio(p.name.lower(), sp_name.lower())
+        if score >= 80:
+            src = "MLB" if team in mlb_probables else "RW"
+            confirmed.append(f"{p.name} ({team}) — {src} '{sp_name}'")
+        else:
+            unconfirmed.append(f"{p.name} ({team}) — SP is {sp_name}")
+
+    ok_lines, bad_lines = confirmed, unconfirmed
+
+    rw_fill = sum(1 for t in confirmed_sps if t not in mlb_probables and t in rotowire_starters)
+    print(f"Confirmed SPs: {len(confirmed_sps)} teams (Rotowire fills: {rw_fill})")
     print(f"DK SP pool: {len(dk_sps)}")
 
     _subsection(f"Confirmed ({len(ok_lines)})")
@@ -426,7 +447,8 @@ def main() -> None:
     _report_sp_confirmation(players)
 
     print("\nBuilding projections (models + Vegas + probable SP filter)...")
-    probable_pitchers = get_mlb_probable_pitchers()
+    from data_pipeline.ingestion.probable_pitchers import get_confirmed_sps
+    probable_pitchers = get_confirmed_sps()
     rotowire_starters = get_confirmed_starters()
     projections = inference.build_projections(
         players,

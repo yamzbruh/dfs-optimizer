@@ -555,12 +555,12 @@ async def generate_projections() -> list[ProjectionResponse]:
         if _slate_inference is not None:
             logger.info("Using SlateInference for real model projections")
             _slate_inference.load_vegas()
-            from automation.scheduler import get_mlb_probable_pitchers
+            from data_pipeline.ingestion.probable_pitchers import get_confirmed_sps
 
             try:
-                probable_pitchers = get_mlb_probable_pitchers()
+                probable_pitchers = get_confirmed_sps()
                 logger.info(
-                    f"Probable pitchers loaded: {len(probable_pitchers)} teams"
+                    f"Confirmed SPs loaded: {len(probable_pitchers)} teams"
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"Failed to load probable pitchers: {exc}")
