@@ -10,12 +10,14 @@ from __future__ import annotations
 
 from datetime import date
 
+import unicodedata
 import requests
 from loguru import logger
 
 from data_pipeline.ingestion.rotowire_lineups import get_confirmed_starters
 
 MLB_API_TO_DK: dict[str, str] = {
+    "AZ": "ARI",  # MLB API abbr for Arizona
     "ARI": "ARI",
     "ATL": "ATL",
     "BAL": "BAL",
@@ -49,6 +51,15 @@ MLB_API_TO_DK: dict[str, str] = {
     "WSH": "WSH",
     "WSN": "WSH",
 }
+
+
+def _normalize_name(name: str) -> str:
+    """Strip accents for fuzzy name comparison."""
+    return "".join(
+        c
+        for c in unicodedata.normalize("NFD", (name or "").lower())
+        if unicodedata.category(c) != "Mn"
+    )
 
 
 def get_mlb_probable_pitchers() -> dict[str, str]:
@@ -109,8 +120,8 @@ def get_confirmed_sps() -> dict[str, str]:
             rw_fills += 1
         else:
             mlb_name = merged[team]
-            mlb_last = mlb_name.split()[-1].lower() if mlb_name else ""
-            rw_last = rw_name.split()[-1].lower() if rw_name else ""
+            mlb_last = _normalize_name(mlb_name.split()[-1]) if mlb_name else ""
+            rw_last = _normalize_name(rw_name.split()[-1]) if rw_name else ""
             if mlb_last and rw_last and mlb_last != rw_last:
                 logger.warning(
                     f"SP conflict {team}: MLB API='{mlb_name}' vs Rotowire='{rw_name}' "
